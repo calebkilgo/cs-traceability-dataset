@@ -1,0 +1,39 @@
+{
+  "num_requirements": 114,
+  "num_functions": 65,
+  "num_positives": 284,
+  "num_hard_negatives": 228,
+  "hard_negatives_per_positive": 2,
+  "splits": {
+    "train": {
+      "num_requirements": 94,
+      "num_positives": 259,
+      "num_triplets": 518,
+      "cs_groups": [
+        "1",
+        "2",
+        "3",
+        "5",
+        "6",
+        "7",
+        "9"
+      ]
+    },
+    "val": {
+      "num_requirements": 13,
+      "num_positives": 17,
+      "num_triplets": 34,
+      "cs_groups": [
+        "4"
+      ]
+    },
+    "test": {
+      "num_requirements": 7,
+      "num_positives": 8,
+      "num_triplets": 16,
+      "cs_groups": [
+        "8"
+      ]
+    }
+  }
+}

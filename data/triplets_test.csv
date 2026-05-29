@@ -1,0 +1,17 @@
+req_id,pos_fn_id,neg_fn_id
+CS8000,CS_EnableAllCSCmd,CS_ComputeApp
+CS8000,CS_EnableAllCSCmd,CS_BackgroundEeprom
+CS8001,CS_DisableAllCSCmd,CS_ComputeApp
+CS8001,CS_DisableAllCSCmd,CS_BackgroundEeprom
+CS8002,CS_OneShotCmd,CS_BackgroundCheckCycleCmd
+CS8002,CS_OneShotCmd,CS_AppInit
+CS8002,CS_OneShotChildTask,CS_BackgroundCheckCycleCmd
+CS8002,CS_OneShotChildTask,CS_AppInit
+CS8002.1,CS_OneShotChildTask,CS_AppInit
+CS8002.1,CS_OneShotChildTask,CS_RecomputeTablesChildTask
+CS8002.2,CS_OneShotCmd,CS_OneShotChildTask
+CS8002.2,CS_OneShotCmd,CS_BackgroundCheckCycleCmd
+CS8002.3,CS_OneShotCmd,CS_OneShotChildTask
+CS8002.3,CS_OneShotCmd,CS_AppInit
+CS8003,CS_CancelOneShotCmd,CS_OneShotChildTask
+CS8003,CS_CancelOneShotCmd,CS_BackgroundCheckCycleCmd

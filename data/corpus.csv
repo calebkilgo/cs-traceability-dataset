@@ -1,0 +1,3103 @@
+fn_id,fn_text
+CS_NoopCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_NoopCmd(const CS_NoopCmd_t *CmdPtr)
+{
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    CFE_EVS_SendEvent(CS_NOOP_INF_EID, CFE_EVS_EventType_INFORMATION, ""No-op command. Version %d.%d.%d.%d"",
+                      CS_MAJOR_VERSION, CS_MINOR_VERSION, CS_REVISION, CS_MISSION_REV);
+
+    return CFE_SUCCESS;
+}"
+CS_ResetCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ResetCmd(const CS_ResetCmd_t *CmdPtr)
+{
+    CS_AppData.HkPacket.Payload.CmdCounter    = 0;
+    CS_AppData.HkPacket.Payload.CmdErrCounter = 0;
+
+    CS_AppData.HkPacket.Payload.EepromCSErrCounter  = 0;
+    CS_AppData.HkPacket.Payload.MemoryCSErrCounter  = 0;
+    CS_AppData.HkPacket.Payload.TablesCSErrCounter  = 0;
+    CS_AppData.HkPacket.Payload.AppCSErrCounter     = 0;
+    CS_AppData.HkPacket.Payload.CfeCoreCSErrCounter = 0;
+    CS_AppData.HkPacket.Payload.OSCSErrCounter      = 0;
+    CS_AppData.HkPacket.Payload.PassCounter         = 0;
+
+    CFE_EVS_SendEvent(CS_RESET_INF_EID, CFE_EVS_EventType_DEBUG, ""Reset Counters command recieved"");
+
+    return CFE_SUCCESS;
+}"
+CS_VerifyCmdLength,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+bool CS_VerifyCmdLength(const CFE_MSG_Message_t *msg, size_t ExpectedLength)
+{
+    CFE_SB_MsgId_t    MessageID    = CFE_SB_INVALID_MSG_ID;
+    CFE_MSG_FcnCode_t CommandCode  = 0;
+    bool              Result       = true;
+    size_t            ActualLength = 0;
+
+    CFE_MSG_GetSize(msg, &ActualLength);
+
+    /* Verify the command packet length */
+    if (ExpectedLength != ActualLength)
+    {
+        CFE_MSG_GetMsgId(msg, &MessageID);
+        CFE_MSG_GetFcnCode(msg, &CommandCode);
+
+        CFE_EVS_SendEvent(CS_CMD_LEN_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Invalid msg length: ID = 0x%08lX, CC = %d, Len = %lu, Expected = %lu"",
+                          (unsigned long)CFE_SB_MsgIdToValue(MessageID), CommandCode, (unsigned long)ActualLength,
+                          (unsigned long)ExpectedLength);
+        Result = false;
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+    return Result;
+}"
+CS_OneShotCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_OneShotCmd(const CS_OneShotCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CFE_ES_TaskId_t ChildTaskID;
+    CFE_Status_t    Status;
+
+    /* validate size and address */
+    Status = CFE_PSP_MemValidateRange(CmdPtr->Payload.Address, CmdPtr->Payload.Size, CFE_PSP_MEM_ANY);
+
+    if (Status == CFE_SUCCESS)
+    {
+        if (CS_AppData.HkPacket.Payload.RecomputeInProgress == false &&
+            CS_AppData.HkPacket.Payload.OneShotInProgress == false)
+        {
+            /* There is no child task running right now, we can use it*/
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+            CS_AppData.HkPacket.Payload.OneShotInProgress   = true;
+
+            CS_AppData.HkPacket.Payload.LastOneShotAddress = CmdPtr->Payload.Address;
+            CS_AppData.HkPacket.Payload.LastOneShotSize    = CmdPtr->Payload.Size;
+            if (CmdPtr->Payload.MaxBytesPerCycle == 0)
+            {
+                CS_AppData.HkPacket.Payload.LastOneShotMaxBytesPerCycle = CS_AppData.MaxBytesPerCycle;
+            }
+            else
+            {
+                CS_AppData.HkPacket.Payload.LastOneShotMaxBytesPerCycle = CmdPtr->Payload.MaxBytesPerCycle;
+            }
+
+            CS_AppData.HkPacket.Payload.LastOneShotChecksum = 0;
+
+            Status = CFE_ES_CreateChildTask(&ChildTaskID, CS_ONESHOT_TASK_NAME, CS_OneShotChildTask, NULL,
+                                            CFE_PLATFORM_ES_DEFAULT_STACK_SIZE, CS_CHILD_TASK_PRIORITY, 0);
+            if (Status == CFE_SUCCESS)
+            {
+                CFE_EVS_SendEvent(CS_ONESHOT_STARTED_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""OneShot checksum started on address: 0x%08X, size: %d"",
+                                  (unsigned int)(CmdPtr->Payload.Address), (int)(CmdPtr->Payload.Size));
+
+                CS_AppData.ChildTaskID = ChildTaskID;
+                CS_AppData.HkPacket.Payload.CmdCounter++;
+            }
+            else /* child task creation failed */
+            {
+                CFE_EVS_SendEvent(CS_ONESHOT_CREATE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                                  ""OneShot checkum failed, CFE_ES_CreateChildTask returned: 0x%08X"",
+                                  (unsigned int)Status);
+
+                CS_AppData.HkPacket.Payload.CmdErrCounter++;
+                CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+                CS_AppData.HkPacket.Payload.OneShotInProgress   = false;
+            }
+        }
+        else
+        {
+            /*send event that we can't start another task right now */
+            CFE_EVS_SendEvent(CS_ONESHOT_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""OneShot checksum failed: child task in use"");
+
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end if CFE_PSP_MemValidateRange */
+    else
+    {
+        CFE_EVS_SendEvent(CS_ONESHOT_MEMVALIDATE_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""OneShot checksum failed, CFE_PSP_MemValidateRange returned: 0x%08X"", (unsigned int)Status);
+
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_CancelOneShotCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_CancelOneShotCmd(const CS_CancelOneShotCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CFE_Status_t Status;
+
+    /* Make sure there is a OneShot command in use */
+    if (CS_AppData.HkPacket.Payload.RecomputeInProgress == false &&
+        CS_AppData.HkPacket.Payload.OneShotInProgress == true)
+    {
+        Status = CFE_ES_DeleteChildTask(CS_AppData.ChildTaskID);
+
+        if (Status == CFE_SUCCESS)
+        {
+            CS_AppData.ChildTaskID                          = CFE_ES_TASKID_UNDEFINED;
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+            CS_AppData.HkPacket.Payload.OneShotInProgress   = false;
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+            CFE_EVS_SendEvent(CS_ONESHOT_CANCELLED_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""OneShot checksum calculation has been cancelled"");
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_ONESHOT_CANCEL_DELETE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Cancel OneShot checksum failed, CFE_ES_DeleteChildTask returned:  0x%08X"",
+                              (unsigned int)Status);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    }
+    else
+    {
+        CFE_EVS_SendEvent(CS_ONESHOT_CANCEL_NO_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Cancel OneShot checksum failed. No OneShot active"");
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_EnableAllCSCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableAllCSCmd(const CS_EnableAllCSCmd_t *CmdPtr)
+{
+    CS_AppData.HkPacket.Payload.ChecksumState = CS_ChecksumState_ENABLED;
+
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    CFE_EVS_SendEvent(CS_ENABLE_ALL_INF_EID, CFE_EVS_EventType_INFORMATION, ""Background Checksumming Enabled"");
+
+    return CFE_SUCCESS;
+}"
+CS_DisableAllCSCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableAllCSCmd(const CS_DisableAllCSCmd_t *CmdPtr)
+{
+    CS_AppData.HkPacket.Payload.ChecksumState = CS_ChecksumState_DISABLED;
+
+    /* zero out the temp values in all the tables
+     so that when the checksums are re-enabled,
+     they don't start with a half-old value */
+    CS_ZeroEepromTempValues();
+    CS_ZeroMemoryTempValues();
+    CS_ZeroTablesTempValues();
+    CS_ZeroAppTempValues();
+    CS_ZeroCfeCoreTempValues();
+    CS_ZeroOSTempValues();
+
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    CFE_EVS_SendEvent(CS_DISABLE_ALL_INF_EID, CFE_EVS_EventType_INFORMATION, ""Background Checksumming Disabled"");
+
+    return CFE_SUCCESS;
+}"
+CS_EnableCfeCoreCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableCfeCoreCmd(const CS_EnableCfeCoreCmd_t *CmdPtr)
+{
+    CS_AppData.HkPacket.Payload.CfeCoreCSState = CS_ChecksumState_ENABLED;
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+    CS_UpdateCDS();
+#endif
+
+    CFE_EVS_SendEvent(CS_ENABLE_CFECORE_INF_EID, CFE_EVS_EventType_INFORMATION, ""Checksumming of cFE Core is Enabled"");
+
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    return CFE_SUCCESS;
+}"
+CS_DisableCfeCoreCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableCfeCoreCmd(const CS_DisableCfeCoreCmd_t *CmdPtr)
+{
+    CS_AppData.HkPacket.Payload.CfeCoreCSState = CS_ChecksumState_DISABLED;
+    CS_ZeroCfeCoreTempValues();
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+    CS_UpdateCDS();
+#endif
+
+    CFE_EVS_SendEvent(CS_DISABLE_CFECORE_INF_EID, CFE_EVS_EventType_INFORMATION,
+                      ""Checksumming of cFE Core is Disabled"");
+
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    return CFE_SUCCESS;
+}"
+CS_ReportBaselineCfeCoreCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ReportBaselineCfeCoreCmd(const CS_ReportBaselineCfeCoreCmd_t *CmdPtr)
+{
+    CS_Res_EepromMemory_Table_Entry_t *CfeCoreCodeSeg = CS_GetCfeCoreCodeSegResTable();
+
+    if (CfeCoreCodeSeg->ComputedYet == true)
+    {
+        CFE_EVS_SendEvent(CS_BASELINE_CFECORE_INF_EID, CFE_EVS_EventType_INFORMATION, ""Baseline of cFE Core is 0x%08X"",
+                          (unsigned int)CfeCoreCodeSeg->ComparisonValue);
+    }
+    else
+    {
+        CFE_EVS_SendEvent(CS_NO_BASELINE_CFECORE_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Baseline of cFE Core has not been computed yet"");
+    }
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    return CFE_SUCCESS;
+}"
+CS_RecomputeBaselineCfeCoreCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_RecomputeBaselineCfeCoreCmd(const CS_RecomputeBaselineCfeCoreCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CFE_ES_TaskId_t ChildTaskID;
+    CFE_Status_t    Status;
+
+    if (CS_AppData.HkPacket.Payload.RecomputeInProgress == false &&
+        CS_AppData.HkPacket.Payload.OneShotInProgress == false)
+    {
+        /* There is no child task running right now, we can use it*/
+        CS_AppData.HkPacket.Payload.RecomputeInProgress = true;
+
+        /* fill in child task variables */
+        CS_AppData.ChildTaskTable                = CS_ChecksumType_CFECORE;
+        CS_AppData.ChildTaskEntryID              = 0;
+        CS_AppData.RecomputeEepromMemoryEntryPtr = CS_GetCfeCoreCodeSegResTable();
+
+        Status = CFE_ES_CreateChildTask(&ChildTaskID, CS_RECOMP_CFECORE_TASK_NAME, CS_RecomputeEepromMemoryChildTask,
+                                        NULL, CFE_PLATFORM_ES_DEFAULT_STACK_SIZE, CS_CHILD_TASK_PRIORITY, 0);
+
+        if (Status == CFE_SUCCESS)
+        {
+            CFE_EVS_SendEvent(CS_RECOMPUTE_CFECORE_STARTED_DBG_EID, CFE_EVS_EventType_DEBUG,
+                              ""Recompute of cFE core started"");
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else /* child task creation failed */
+        {
+            CFE_EVS_SendEvent(CS_RECOMPUTE_CFECORE_CREATE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Recompute cFE core failed, CFE_ES_CreateChildTask returned: 0x%08X"",
+                              (unsigned int)Status);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+        }
+    }
+    else
+    {
+        /*send event that we can't start another task right now */
+        CFE_EVS_SendEvent(CS_RECOMPUTE_CFECORE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Recompute cFE core failed: child task in use"");
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_EnableOSCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableOSCmd(const CS_EnableOSCmd_t *CmdPtr)
+{
+    CS_AppData.HkPacket.Payload.OSCSState = CS_ChecksumState_ENABLED;
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+    CS_UpdateCDS();
+#endif
+
+    CFE_EVS_SendEvent(CS_ENABLE_OS_INF_EID, CFE_EVS_EventType_INFORMATION,
+                      ""Checksumming of OS code segment is Enabled"");
+
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    return CFE_SUCCESS;
+}"
+CS_DisableOSCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableOSCmd(const CS_DisableOSCmd_t *CmdPtr)
+{
+    CS_AppData.HkPacket.Payload.OSCSState = CS_ChecksumState_DISABLED;
+    CS_ZeroOSTempValues();
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+    CS_UpdateCDS();
+#endif
+
+    CFE_EVS_SendEvent(CS_DISABLE_OS_INF_EID, CFE_EVS_EventType_INFORMATION,
+                      ""Checksumming of OS code segment is Disabled"");
+
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    return CFE_SUCCESS;
+}"
+CS_ReportBaselineOSCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ReportBaselineOSCmd(const CS_ReportBaselineOSCmd_t *CmdPtr)
+{
+    CS_Res_EepromMemory_Table_Entry_t *OSCodeSeg = CS_GetOSCodeSegResTable();
+
+    if (OSCodeSeg->ComputedYet == true)
+    {
+        CFE_EVS_SendEvent(CS_BASELINE_OS_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Baseline of OS code segment is 0x%08X"", (unsigned int)OSCodeSeg->ComparisonValue);
+    }
+    else
+    {
+        CFE_EVS_SendEvent(CS_NO_BASELINE_OS_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Baseline of OS code segment has not been computed yet"");
+    }
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    return CFE_SUCCESS;
+}"
+CS_RecomputeBaselineOSCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_RecomputeBaselineOSCmd(const CS_RecomputeBaselineOSCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CFE_ES_TaskId_t ChildTaskID;
+    CFE_Status_t    Status;
+
+    if (CS_AppData.HkPacket.Payload.RecomputeInProgress == false &&
+        CS_AppData.HkPacket.Payload.OneShotInProgress == false)
+    {
+        /* There is no child task running right now, we can use it*/
+        CS_AppData.HkPacket.Payload.RecomputeInProgress = true;
+
+        /* fill in child task variables */
+        CS_AppData.ChildTaskTable                = CS_ChecksumType_OSCORE;
+        CS_AppData.ChildTaskEntryID              = 0;
+        CS_AppData.RecomputeEepromMemoryEntryPtr = CS_GetOSCodeSegResTable();
+
+        Status = CFE_ES_CreateChildTask(&ChildTaskID, CS_RECOMP_OS_TASK_NAME, CS_RecomputeEepromMemoryChildTask, NULL,
+                                        CFE_PLATFORM_ES_DEFAULT_STACK_SIZE, CS_CHILD_TASK_PRIORITY, 0);
+        if (Status == CFE_SUCCESS)
+        {
+            CFE_EVS_SendEvent(CS_RECOMPUTE_OS_STARTED_DBG_EID, CFE_EVS_EventType_DEBUG,
+                              ""Recompute of OS code segment started"");
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else /* child task creation failed */
+        {
+            CFE_EVS_SendEvent(CS_RECOMPUTE_OS_CREATE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Recompute OS code segment failed, CFE_ES_CreateChildTask returned: 0x%08X"",
+                              (unsigned int)Status);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+        }
+    }
+    else
+    {
+        /*send event that we can't start another task right now */
+        CFE_EVS_SendEvent(CS_RECOMPUTE_OS_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Recompute OS code segment failed: child task in use"");
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_EnableEepromCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableEepromCmd(const CS_EnableEepromCmd_t *CmdPtr)
+{
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        CS_AppData.HkPacket.Payload.EepromCSState = CS_ChecksumState_ENABLED;
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        CS_UpdateCDS();
+#endif
+
+        CFE_EVS_SendEvent(CS_ENABLE_EEPROM_INF_EID, CFE_EVS_EventType_INFORMATION, ""Checksumming of EEPROM is Enabled"");
+
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_DisableEepromCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableEepromCmd(const CS_DisableEepromCmd_t *CmdPtr)
+{
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        CS_AppData.HkPacket.Payload.EepromCSState = CS_ChecksumState_DISABLED;
+        CS_ZeroEepromTempValues();
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        CS_UpdateCDS();
+#endif
+
+        CFE_EVS_SendEvent(CS_DISABLE_EEPROM_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Checksumming of EEPROM is Disabled"");
+
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_ReportBaselineEntryIDEepromCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ReportBaselineEntryIDEepromCmd(const CS_ReportBaselineEntryIDEepromCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    uint32                             Baseline     = 0;
+    uint16                             EntryID      = 0;
+    CS_ChecksumState_Enum_t            State        = CS_ChecksumState_EMPTY;
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+
+    EntryID      = CmdPtr->Payload.EntryID;
+    ResultsEntry = CS_GetEepromResEntry(EntryID);
+
+    if (ResultsEntry == NULL)
+    {
+        State = CS_ChecksumState_UNDEFINED;
+    }
+    else
+    {
+        State = ResultsEntry->State;
+    }
+
+    if (CS_StateValid(State))
+    {
+        ResultsEntry->State = CS_ChecksumState_ENABLED;
+
+        if (ResultsEntry->ComputedYet == true)
+        {
+            Baseline = ResultsEntry->ComparisonValue;
+
+            CFE_EVS_SendEvent(CS_BASELINE_EEPROM_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Report baseline of EEPROM Entry %d is 0x%08X"", EntryID, (unsigned int)Baseline);
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_NO_BASELINE_EEPROM_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Report baseline of EEPROM Entry %d has not been computed yet"", EntryID);
+        }
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+    else
+    {
+        CFE_EVS_SendEvent(CS_BASELINE_INVALID_ENTRY_EEPROM_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""EEPROM report baseline failed, Entry ID invalid: %d, State: %d Max ID: %d"", EntryID, State,
+                          (CS_MAX_NUM_EEPROM_TABLE_ENTRIES - 1));
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_RecomputeBaselineEepromCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_RecomputeBaselineEepromCmd(const CS_RecomputeBaselineEepromCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CFE_ES_TaskId_t                    ChildTaskID  = CFE_ES_TASKID_UNDEFINED;
+    CFE_Status_t                       Status       = CS_ERROR;
+    uint16                             EntryID      = 0;
+    CS_ChecksumState_Enum_t            State        = CS_ChecksumState_EMPTY;
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+
+    if (CS_AppData.HkPacket.Payload.RecomputeInProgress == false &&
+        CS_AppData.HkPacket.Payload.OneShotInProgress == false)
+    {
+        EntryID      = CmdPtr->Payload.EntryID;
+        ResultsEntry = CS_GetEepromResEntry(EntryID);
+
+        if (ResultsEntry == NULL)
+        {
+            State = CS_ChecksumState_UNDEFINED;
+        }
+        else
+        {
+            State = ResultsEntry->State;
+        }
+
+        if (CS_StateValid(State))
+        {
+            /* There is no child task running right now, we can use it*/
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = true;
+
+            /* fill in child task variables */
+            CS_AppData.ChildTaskTable   = CS_ChecksumType_EEPROM_TABLE;
+            CS_AppData.ChildTaskEntryID = EntryID;
+
+            CS_AppData.RecomputeEepromMemoryEntryPtr = ResultsEntry;
+
+            Status = CFE_ES_CreateChildTask(&ChildTaskID, CS_RECOMP_EEPROM_TASK_NAME, CS_RecomputeEepromMemoryChildTask,
+                                            NULL, CFE_PLATFORM_ES_DEFAULT_STACK_SIZE, CS_CHILD_TASK_PRIORITY, 0);
+            if (Status == CFE_SUCCESS)
+            {
+                CFE_EVS_SendEvent(CS_RECOMPUTE_EEPROM_STARTED_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""Recompute baseline of EEPROM Entry ID %d started"", EntryID);
+                CS_AppData.HkPacket.Payload.CmdCounter++;
+            }
+            else /* child task creation failed */
+            {
+                CFE_EVS_SendEvent(
+                    CS_RECOMPUTE_EEPROM_CREATE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                    ""Recompute baseline of EEPROM Entry ID %d failed, CFE_ES_CreateChildTask returned:  0x%08X"",
+                    EntryID, (unsigned int)Status);
+                CS_AppData.HkPacket.Payload.CmdErrCounter++;
+                CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+            }
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_RECOMPUTE_INVALID_ENTRY_EEPROM_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""EEPROM recompute baseline of entry failed, Entry ID invalid: %d, State: %d, Max ID: %d"",
+                              EntryID, State, (CS_MAX_NUM_EEPROM_TABLE_ENTRIES - 1));
+
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    }
+    else
+    {
+        /*send event that we can't start another task right now */
+        CFE_EVS_SendEvent(CS_RECOMPUTE_EEPROM_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Recompute baseline of EEPROM Entry ID %d failed: child task in use"", EntryID);
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_EnableEntryIDEepromCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableEntryIDEepromCmd(const CS_EnableEntryIDEepromCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+    CS_Def_EepromMemory_Table_Entry_t *DefEntry     = NULL;
+    CS_TableWrapper_t *                tw           = &CS_AppData.Tbl[CS_ChecksumType_EEPROM_TABLE];
+    uint16                             EntryID      = 0;
+    CS_ChecksumState_Enum_t            State        = CS_ChecksumState_EMPTY;
+
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        EntryID      = CmdPtr->Payload.EntryID;
+        ResultsEntry = CS_GetEepromResEntry(EntryID);
+
+        if (ResultsEntry == NULL)
+        {
+            State = CS_ChecksumState_UNDEFINED;
+        }
+        else
+        {
+            State = ResultsEntry->State;
+        }
+
+        if (CS_StateValid(State))
+        {
+            DefEntry = CS_GetEepromDefEntry(EntryID);
+
+            ResultsEntry->State = CS_ChecksumState_ENABLED;
+
+            CFE_EVS_SendEvent(CS_ENABLE_EEPROM_ENTRY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Checksumming of EEPROM Entry ID %d is Enabled"", EntryID);
+
+            State = CS_SetDefEntryState(tw, DefEntry, CS_ChecksumState_ENABLED);
+            if (!CS_StateValid(State))
+            {
+                CFE_EVS_SendEvent(CS_ENABLE_EEPROM_DEF_EMPTY_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""CS unable to update EEPROM definition table for entry %d, State: %d"", EntryID,
+                                  State);
+            }
+
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_ENABLE_EEPROM_INVALID_ENTRY_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Enable EEPROM entry failed, invalid Entry ID:  %d, State: %d, Max ID: %d"", EntryID,
+                              State, (CS_MAX_NUM_EEPROM_TABLE_ENTRIES - 1));
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end InProgress if */
+
+    return CFE_SUCCESS;
+}"
+CS_DisableEntryIDEepromCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableEntryIDEepromCmd(const CS_DisableEntryIDEepromCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+    CS_Def_EepromMemory_Table_Entry_t *DefEntry     = NULL;
+    CS_TableWrapper_t *                tw           = &CS_AppData.Tbl[CS_ChecksumType_EEPROM_TABLE];
+    uint16                             EntryID      = 0;
+    CS_ChecksumState_Enum_t            State        = CS_ChecksumState_EMPTY;
+
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        EntryID      = CmdPtr->Payload.EntryID;
+        ResultsEntry = CS_GetEepromResEntry(EntryID);
+
+        if (ResultsEntry == NULL)
+        {
+            State = CS_ChecksumState_UNDEFINED;
+        }
+        else
+        {
+            State = ResultsEntry->State;
+        }
+
+        if (CS_StateValid(State))
+        {
+            DefEntry = CS_GetEepromDefEntry(EntryID);
+
+            ResultsEntry->State             = CS_ChecksumState_DISABLED;
+            ResultsEntry->TempChecksumValue = 0;
+            ResultsEntry->ByteOffset        = 0;
+
+            CFE_EVS_SendEvent(CS_DISABLE_EEPROM_ENTRY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Checksumming of EEPROM Entry ID %d is Disabled"", EntryID);
+
+            State = CS_SetDefEntryState(tw, DefEntry, CS_ChecksumState_DISABLED);
+            if (!CS_StateValid(State))
+            {
+                CFE_EVS_SendEvent(CS_DISABLE_EEPROM_DEF_EMPTY_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""CS unable to update EEPROM definition table for entry %d, State: %d"", EntryID,
+                                  State);
+            }
+
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_DISABLE_EEPROM_INVALID_ENTRY_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Disable EEPROM entry failed, invalid Entry ID:  %d, State: %d, Max ID: %d"", EntryID,
+                              State, (CS_MAX_NUM_EEPROM_TABLE_ENTRIES - 1));
+
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end InProgress if */
+
+    return CFE_SUCCESS;
+}"
+CS_GetEntryIDEepromCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_GetEntryIDEepromCmd(const CS_GetEntryIDEepromCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    uint16                             Loop       = 0;
+    bool                               EntryFound = false;
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry;
+
+    Loop = 0;
+    while (true)
+    {
+        ResultsEntry = CS_GetEepromResEntry(Loop);
+        if (ResultsEntry == NULL)
+        {
+            break;
+        }
+
+        if (ResultsEntry->State != CS_ChecksumState_EMPTY && ResultsEntry->StartAddress <= CmdPtr->Payload.Address &&
+            CmdPtr->Payload.Address < (ResultsEntry->StartAddress + ResultsEntry->NumBytesToChecksum))
+        {
+            CFE_EVS_SendEvent(CS_GET_ENTRY_ID_EEPROM_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""EEPROM Found Address 0x%08X in Entry ID %d"", (unsigned int)(CmdPtr->Payload.Address),
+                              Loop);
+            EntryFound = true;
+        }
+        ++Loop;
+    }
+
+    if (EntryFound == false)
+    {
+        CFE_EVS_SendEvent(CS_GET_ENTRY_ID_EEPROM_NOT_FOUND_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Address 0x%08X was not found in EEPROM table"", (unsigned int)(CmdPtr->Payload.Address));
+    }
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    return CFE_SUCCESS;
+}"
+CS_EnableMemoryCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableMemoryCmd(const CS_EnableMemoryCmd_t *CmdPtr)
+{
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        CS_AppData.HkPacket.Payload.MemoryCSState = CS_ChecksumState_ENABLED;
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        CS_UpdateCDS();
+#endif
+
+        CFE_EVS_SendEvent(CS_ENABLE_MEMORY_INF_EID, CFE_EVS_EventType_INFORMATION, ""Checksumming of Memory is Enabled"");
+
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_DisableMemoryCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableMemoryCmd(const CS_DisableMemoryCmd_t *CmdPtr)
+{
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        CS_AppData.HkPacket.Payload.MemoryCSState = CS_ChecksumState_DISABLED;
+        CS_ZeroMemoryTempValues();
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        CS_UpdateCDS();
+#endif
+
+        CFE_EVS_SendEvent(CS_DISABLE_MEMORY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Checksumming of Memory is Disabled"");
+
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_ReportBaselineEntryIDMemoryCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ReportBaselineEntryIDMemoryCmd(const CS_ReportBaselineEntryIDMemoryCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+    uint32                             Baseline     = 0;
+    uint16                             EntryID      = 0;
+    CS_ChecksumState_Enum_t            State        = CS_ChecksumState_EMPTY;
+
+    EntryID      = CmdPtr->Payload.EntryID;
+    ResultsEntry = CS_GetMemoryResEntry(EntryID);
+
+    if (ResultsEntry == NULL)
+    {
+        State = CS_ChecksumState_UNDEFINED;
+    }
+    else
+    {
+        State = ResultsEntry->State;
+    }
+
+    if (CS_StateValid(State))
+    {
+        if (ResultsEntry->ComputedYet == true)
+        {
+            Baseline = ResultsEntry->ComparisonValue;
+
+            CFE_EVS_SendEvent(CS_BASELINE_MEMORY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Report baseline of Memory Entry %d is 0x%08X"", EntryID, (unsigned int)Baseline);
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_NO_BASELINE_MEMORY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Report baseline of Memory Entry %d has not been computed yet"", EntryID);
+        }
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+    else
+    {
+        CFE_EVS_SendEvent(CS_BASELINE_INVALID_ENTRY_MEMORY_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Memory report baseline failed, Entry ID invalid: %d, State: %d Max ID: %d"", EntryID, State,
+                          (CS_MAX_NUM_MEMORY_TABLE_ENTRIES - 1));
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_RecomputeBaselineMemoryCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_RecomputeBaselineMemoryCmd(const CS_RecomputeBaselineMemoryCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+    CFE_ES_TaskId_t                    ChildTaskID  = CFE_ES_TASKID_UNDEFINED;
+    CFE_Status_t                       Status       = CS_ERROR;
+    uint16                             EntryID      = 0;
+    CS_ChecksumState_Enum_t            State        = CS_ChecksumState_EMPTY;
+
+    EntryID = CmdPtr->Payload.EntryID;
+
+    if (CS_AppData.HkPacket.Payload.RecomputeInProgress == false &&
+        CS_AppData.HkPacket.Payload.OneShotInProgress == false)
+    {
+        ResultsEntry = CS_GetMemoryResEntry(EntryID);
+
+        if (ResultsEntry == NULL)
+        {
+            State = CS_ChecksumState_UNDEFINED;
+        }
+        else
+        {
+            State = ResultsEntry->State;
+        }
+
+        if (CS_StateValid(State))
+        {
+            /* There is no child task running right now, we can use it*/
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = true;
+
+            /* fill in child task variables */
+            CS_AppData.ChildTaskTable   = CS_ChecksumType_MEMORY_TABLE;
+            CS_AppData.ChildTaskEntryID = EntryID;
+
+            CS_AppData.RecomputeEepromMemoryEntryPtr = ResultsEntry;
+
+            Status = CFE_ES_CreateChildTask(&ChildTaskID, CS_RECOMP_MEMORY_TASK_NAME, CS_RecomputeEepromMemoryChildTask,
+                                            NULL, CFE_PLATFORM_ES_DEFAULT_STACK_SIZE, CS_CHILD_TASK_PRIORITY, 0);
+            if (Status == CFE_SUCCESS)
+            {
+                CFE_EVS_SendEvent(CS_RECOMPUTE_MEMORY_STARTED_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""Recompute baseline of Memory Entry ID %d started"", EntryID);
+                CS_AppData.HkPacket.Payload.CmdCounter++;
+            }
+            else /* child task creation failed */
+            {
+                CFE_EVS_SendEvent(
+                    CS_RECOMPUTE_MEMORY_CREATE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                    ""Recompute baseline of Memory Entry ID %d failed, ES_CreateChildTask returned:  0x%08X"", EntryID,
+                    (unsigned int)Status);
+                CS_AppData.HkPacket.Payload.CmdErrCounter++;
+                CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+            }
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_RECOMPUTE_INVALID_ENTRY_MEMORY_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Memory recompute baseline of entry failed, Entry ID invalid: %d, State: %d, Max ID: %d"",
+                              EntryID, State, (CS_MAX_NUM_MEMORY_TABLE_ENTRIES - 1));
+
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    }
+    else
+    {
+        /*send event that we can't start another task right now */
+        CFE_EVS_SendEvent(CS_RECOMPUTE_MEMORY_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Recompute baseline of Memory Entry ID %d failed: child task in use"", EntryID);
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_EnableEntryIDMemoryCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableEntryIDMemoryCmd(const CS_EnableEntryIDMemoryCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+    CS_Def_EepromMemory_Table_Entry_t *DefEntry     = NULL;
+    CS_TableWrapper_t *                tw           = &CS_AppData.Tbl[CS_ChecksumType_MEMORY_TABLE];
+    uint16                             EntryID      = 0;
+    CS_ChecksumState_Enum_t            State        = CS_ChecksumState_EMPTY;
+
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        EntryID      = CmdPtr->Payload.EntryID;
+        ResultsEntry = CS_GetMemoryResEntry(EntryID);
+
+        if (ResultsEntry == NULL)
+        {
+            State = CS_ChecksumState_UNDEFINED;
+        }
+        else
+        {
+            State = ResultsEntry->State;
+        }
+
+        if (CS_StateValid(State))
+        {
+            DefEntry            = CS_GetMemoryDefEntry(EntryID);
+            ResultsEntry->State = CS_ChecksumState_ENABLED;
+
+            CFE_EVS_SendEvent(CS_ENABLE_MEMORY_ENTRY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Checksumming of Memory Entry ID %d is Enabled"", EntryID);
+
+            State = CS_SetDefEntryState(tw, DefEntry, CS_ChecksumState_ENABLED);
+            if (!CS_StateValid(State))
+            {
+                CFE_EVS_SendEvent(CS_ENABLE_MEMORY_DEF_EMPTY_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""CS unable to update memory definition table for entry %d, State: %d"", EntryID,
+                                  State);
+            }
+
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_ENABLE_MEMORY_INVALID_ENTRY_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Enable Memory entry failed, invalid Entry ID:  %d, State: %d, Max ID: %d"", EntryID,
+                              State, (CS_MAX_NUM_MEMORY_TABLE_ENTRIES - 1));
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end InProgress if */
+
+    return CFE_SUCCESS;
+}"
+CS_DisableEntryIDMemoryCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableEntryIDMemoryCmd(const CS_DisableEntryIDMemoryCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+    CS_Def_EepromMemory_Table_Entry_t *DefEntry     = NULL;
+    CS_TableWrapper_t *                tw           = &CS_AppData.Tbl[CS_ChecksumType_MEMORY_TABLE];
+    uint16                             EntryID      = 0;
+    CS_ChecksumState_Enum_t            State        = CS_ChecksumState_EMPTY;
+
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        EntryID      = CmdPtr->Payload.EntryID;
+        ResultsEntry = CS_GetMemoryResEntry(EntryID);
+
+        if (ResultsEntry == NULL)
+        {
+            State = CS_ChecksumState_UNDEFINED;
+        }
+        else
+        {
+            State = ResultsEntry->State;
+        }
+
+        if (CS_StateValid(State))
+        {
+            DefEntry = CS_GetMemoryDefEntry(EntryID);
+
+            ResultsEntry->State             = CS_ChecksumState_DISABLED;
+            ResultsEntry->TempChecksumValue = 0;
+            ResultsEntry->ByteOffset        = 0;
+
+            CFE_EVS_SendEvent(CS_DISABLE_MEMORY_ENTRY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Checksumming of Memory Entry ID %d is Disabled"", EntryID);
+
+            State = CS_SetDefEntryState(tw, DefEntry, CS_ChecksumState_DISABLED);
+            if (!CS_StateValid(State))
+            {
+                CFE_EVS_SendEvent(CS_DISABLE_MEMORY_DEF_EMPTY_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""CS unable to update memory definition table for entry %d, State: %d"", EntryID,
+                                  State);
+            }
+
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_DISABLE_MEMORY_INVALID_ENTRY_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Disable Memory entry failed, invalid Entry ID:  %d, State: %d, Max ID: %d"", EntryID,
+                              State, (CS_MAX_NUM_MEMORY_TABLE_ENTRIES - 1));
+
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end InProgress if */
+
+    return CFE_SUCCESS;
+}"
+CS_GetEntryIDMemoryCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_GetEntryIDMemoryCmd(const CS_GetEntryIDMemoryCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry = NULL;
+    uint16                             Loop         = 0;
+    bool                               EntryFound   = false;
+
+    Loop = 0;
+    while (true)
+    {
+        ResultsEntry = CS_GetMemoryResEntry(Loop);
+        if (ResultsEntry == NULL)
+        {
+            break;
+        }
+
+        if (ResultsEntry->State != CS_ChecksumState_EMPTY && ResultsEntry->StartAddress <= CmdPtr->Payload.Address &&
+            CmdPtr->Payload.Address < (ResultsEntry->StartAddress + ResultsEntry->NumBytesToChecksum))
+        {
+            CFE_EVS_SendEvent(CS_GET_ENTRY_ID_MEMORY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Memory Found Address 0x%08X in Entry ID %d"", (unsigned int)(CmdPtr->Payload.Address),
+                              Loop);
+            EntryFound = true;
+        }
+
+        ++Loop;
+    }
+
+    if (EntryFound == false)
+    {
+        CFE_EVS_SendEvent(CS_GET_ENTRY_ID_MEMORY_NOT_FOUND_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Address 0x%08X was not found in Memory table"", (unsigned int)(CmdPtr->Payload.Address));
+    }
+    CS_AppData.HkPacket.Payload.CmdCounter++;
+
+    return CFE_SUCCESS;
+}"
+CS_EnableTablesCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableTablesCmd(const CS_EnableTablesCmd_t *CmdPtr)
+{
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        CS_AppData.HkPacket.Payload.TablesCSState = CS_ChecksumState_ENABLED;
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        CS_UpdateCDS();
+#endif
+
+        CFE_EVS_SendEvent(CS_ENABLE_TABLES_INF_EID, CFE_EVS_EventType_INFORMATION, ""Checksumming of Tables is Enabled"");
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_DisableTablesCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableTablesCmd(const CS_DisableTablesCmd_t *CmdPtr)
+{
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        CS_AppData.HkPacket.Payload.TablesCSState = CS_ChecksumState_DISABLED;
+        CS_ZeroTablesTempValues();
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        CS_UpdateCDS();
+#endif
+
+        CFE_EVS_SendEvent(CS_DISABLE_TABLES_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Checksumming of Tables is Disabled"");
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_ReportBaselineTableCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ReportBaselineTableCmd(const CS_ReportBaselineTableCmd_t *CmdPtr)
+{
+    CS_Res_Tables_Table_Entry_t *ResultsEntry;
+    uint32                       Baseline;
+    char                         Name[CFE_TBL_MAX_FULL_NAME_LEN];
+
+    strncpy(Name, CmdPtr->Payload.Name, sizeof(Name) - 1);
+    Name[sizeof(Name) - 1] = '\0';
+
+    if (CS_GetTableResTblEntryByName(&ResultsEntry, Name))
+    {
+        if (ResultsEntry->ComputedYet == true)
+        {
+            Baseline = ResultsEntry->ComparisonValue;
+            CFE_EVS_SendEvent(CS_BASELINE_TABLE_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Report baseline of table %s is 0x%08X"", Name, (unsigned int)Baseline);
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_NO_BASELINE_TABLE_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Report baseline of table %s has not been computed yet"", Name);
+        }
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+    else
+    {
+        CFE_EVS_SendEvent(CS_BASELINE_INVALID_NAME_TABLES_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Tables report baseline failed, table %s not found"", Name);
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_RecomputeBaselineTableCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_RecomputeBaselineTableCmd(const CS_RecomputeBaselineTableCmd_t *CmdPtr)
+{
+    CFE_ES_TaskId_t              ChildTaskID;
+    CFE_Status_t                 Status;
+    CS_Res_Tables_Table_Entry_t *ResultsEntry;
+    char                         Name[CFE_TBL_MAX_FULL_NAME_LEN];
+
+    if (CS_AppData.HkPacket.Payload.RecomputeInProgress == false &&
+        CS_AppData.HkPacket.Payload.OneShotInProgress == false)
+    {
+        strncpy(Name, CmdPtr->Payload.Name, sizeof(Name) - 1);
+        Name[sizeof(Name) - 1] = '\0';
+
+        /* make sure the entry is a valid number and is defined in the table */
+        if (CS_GetTableResTblEntryByName(&ResultsEntry, Name))
+        {
+            /* There is no child task running right now, we can use it*/
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = true;
+
+            /* fill in child task variables */
+            CS_AppData.ChildTaskTable = CS_ChecksumType_TABLES_TABLE;
+
+            CS_AppData.RecomputeTablesEntryPtr = ResultsEntry;
+
+            Status = CFE_ES_CreateChildTask(&ChildTaskID, CS_RECOMP_TABLES_TASK_NAME, CS_RecomputeTablesChildTask, NULL,
+                                            CFE_PLATFORM_ES_DEFAULT_STACK_SIZE, CS_CHILD_TASK_PRIORITY, 0);
+            if (Status == CFE_SUCCESS)
+            {
+                CFE_EVS_SendEvent(CS_RECOMPUTE_TABLES_STARTED_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""Recompute baseline of table %s started"", Name);
+                CS_AppData.HkPacket.Payload.CmdCounter++;
+            }
+            else /* child task creation failed */
+            {
+                CFE_EVS_SendEvent(CS_RECOMPUTE_TABLES_CREATE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                                  ""Recompute baseline of table %s failed, CFE_ES_CreateChildTask returned: 0x%08X"",
+                                  Name, (unsigned int)Status);
+                CS_AppData.HkPacket.Payload.CmdErrCounter++;
+                CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+            }
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_RECOMPUTE_UNKNOWN_NAME_TABLES_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Tables recompute baseline failed, table %s not found"", Name);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    }
+    else
+    {
+        /*send event that we can't start another task right now */
+        CFE_EVS_SendEvent(CS_RECOMPUTE_TABLES_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Tables recompute baseline for table %s failed: child task in use"", Name);
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_EnableNameTableCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableNameTableCmd(const CS_EnableNameTableCmd_t *CmdPtr)
+{
+    CS_Res_Tables_Table_Entry_t *ResultsEntry;
+    CS_Def_Tables_Table_Entry_t *DefinitionEntry;
+    CS_TableWrapper_t *          tw = &CS_AppData.Tbl[CS_ChecksumType_TABLES_TABLE];
+    char                         Name[CFE_TBL_MAX_FULL_NAME_LEN];
+
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        strncpy(Name, CmdPtr->Payload.Name, sizeof(Name) - 1);
+        Name[sizeof(Name) - 1] = '\0';
+
+        if (CS_GetTableResTblEntryByName(&ResultsEntry, Name))
+        {
+            ResultsEntry->State = CS_ChecksumState_ENABLED;
+
+            CFE_EVS_SendEvent(CS_ENABLE_TABLES_NAME_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Checksumming of table %s is Enabled"", Name);
+
+            if (CS_GetTableDefTblEntryByName(&DefinitionEntry, Name))
+            {
+                CS_SetDefEntryState(tw, DefinitionEntry, CS_ChecksumState_ENABLED);
+            }
+            else
+            {
+                CFE_EVS_SendEvent(CS_ENABLE_TABLE_DEF_NOT_FOUND_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""CS unable to update tables definition table for entry %s"", Name);
+            }
+
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_ENABLE_TABLES_UNKNOWN_NAME_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Tables enable table command failed, table %s not found"", Name);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end InProgress if */
+
+    return CFE_SUCCESS;
+}"
+CS_DisableNameTableCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableNameTableCmd(const CS_DisableNameTableCmd_t *CmdPtr)
+{
+    CS_Res_Tables_Table_Entry_t *ResultsEntry;
+    CS_Def_Tables_Table_Entry_t *DefinitionEntry;
+    CS_TableWrapper_t *          tw = &CS_AppData.Tbl[CS_ChecksumType_TABLES_TABLE];
+    char                         Name[CFE_TBL_MAX_FULL_NAME_LEN];
+
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        strncpy(Name, CmdPtr->Payload.Name, sizeof(Name) - 1);
+        Name[sizeof(Name) - 1] = '\0';
+
+        if (CS_GetTableResTblEntryByName(&ResultsEntry, Name))
+        {
+            ResultsEntry->State             = CS_ChecksumState_DISABLED;
+            ResultsEntry->TempChecksumValue = 0;
+            ResultsEntry->ByteOffset        = 0;
+
+            CFE_EVS_SendEvent(CS_DISABLE_TABLES_NAME_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Checksumming of table %s is Disabled"", Name);
+
+            if (CS_GetTableDefTblEntryByName(&DefinitionEntry, Name))
+            {
+                CS_SetDefEntryState(tw, DefinitionEntry, CS_ChecksumState_DISABLED);
+            }
+            else
+            {
+                CFE_EVS_SendEvent(CS_DISABLE_TABLE_DEF_NOT_FOUND_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""CS unable to update tables definition table for entry %s"", Name);
+            }
+
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_DISABLE_TABLES_UNKNOWN_NAME_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Tables disable table command failed, table %s not found"", Name);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end InProgress if */
+
+    return CFE_SUCCESS;
+}"
+CS_EnableAppsCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableAppsCmd(const CS_EnableAppsCmd_t *CmdPtr)
+{
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        CS_AppData.HkPacket.Payload.AppCSState = CS_ChecksumState_ENABLED;
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        CS_UpdateCDS();
+#endif
+
+        CFE_EVS_SendEvent(CS_ENABLE_APP_INF_EID, CFE_EVS_EventType_INFORMATION, ""Checksumming of App is Enabled"");
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_DisableAppsCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableAppsCmd(const CS_DisableAppsCmd_t *CmdPtr)
+{
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        CS_AppData.HkPacket.Payload.AppCSState = CS_ChecksumState_DISABLED;
+        CS_ZeroAppTempValues();
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        CS_UpdateCDS();
+#endif
+
+        CFE_EVS_SendEvent(CS_DISABLE_APP_INF_EID, CFE_EVS_EventType_INFORMATION, ""Checksumming of App is Disabled"");
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_ReportBaselineAppCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ReportBaselineAppCmd(const CS_ReportBaselineAppCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_App_Table_Entry_t *ResultsEntry;
+    uint32                    Baseline;
+    char                      Name[OS_MAX_API_NAME];
+
+    strncpy(Name, CmdPtr->Payload.Name, sizeof(Name) - 1);
+    Name[sizeof(Name) - 1] = '\0';
+
+    if (CS_GetAppResTblEntryByName(&ResultsEntry, Name))
+    {
+        if (ResultsEntry->ComputedYet == true)
+        {
+            Baseline = ResultsEntry->ComparisonValue;
+            CFE_EVS_SendEvent(CS_BASELINE_APP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Report baseline of app %s is 0x%08X"", Name, (unsigned int)Baseline);
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_NO_BASELINE_APP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Report baseline of app %s has not been computed yet"", Name);
+        }
+        CS_AppData.HkPacket.Payload.CmdCounter++;
+    }
+    else
+    {
+        CFE_EVS_SendEvent(CS_BASELINE_INVALID_NAME_APP_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""App report baseline failed, app %s not found"", Name);
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_RecomputeBaselineAppCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_RecomputeBaselineAppCmd(const CS_RecomputeBaselineAppCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CFE_ES_TaskId_t           ChildTaskID;
+    CFE_Status_t              Status;
+    CS_Res_App_Table_Entry_t *ResultsEntry;
+    char                      Name[OS_MAX_API_NAME];
+
+    if (CS_AppData.HkPacket.Payload.RecomputeInProgress == false &&
+        CS_AppData.HkPacket.Payload.OneShotInProgress == false)
+    {
+        strncpy(Name, CmdPtr->Payload.Name, sizeof(Name) - 1);
+        Name[sizeof(Name) - 1] = '\0';
+
+        /* make sure the entry is a valid number and is defined in the table */
+        if (CS_GetAppResTblEntryByName(&ResultsEntry, Name))
+        {
+            /* There is no child task running right now, we can use it*/
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = true;
+
+            /* fill in child task variables */
+            CS_AppData.ChildTaskTable = CS_ChecksumType_APP_TABLE;
+
+            CS_AppData.RecomputeAppEntryPtr = ResultsEntry;
+
+            Status = CFE_ES_CreateChildTask(&ChildTaskID, CS_RECOMP_APP_TASK_NAME, CS_RecomputeAppChildTask, NULL,
+                                            CFE_PLATFORM_ES_DEFAULT_STACK_SIZE, CS_CHILD_TASK_PRIORITY, 0);
+            if (Status == CFE_SUCCESS)
+            {
+                CFE_EVS_SendEvent(CS_RECOMPUTE_APP_STARTED_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""Recompute baseline of app %s started"", Name);
+                CS_AppData.HkPacket.Payload.CmdCounter++;
+            }
+            else /* child task creation failed */
+            {
+                CFE_EVS_SendEvent(CS_RECOMPUTE_APP_CREATE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                                  ""Recompute baseline of app %s failed, CFE_ES_CreateChildTask returned: 0x%08X"", Name,
+                                  (unsigned int)Status);
+                CS_AppData.HkPacket.Payload.CmdErrCounter++;
+                CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+            }
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_RECOMPUTE_UNKNOWN_NAME_APP_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""App recompute baseline failed, app %s not found"", Name);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    }
+    else
+    {
+        /*send event that we can't start another task right now */
+        CFE_EVS_SendEvent(CS_RECOMPUTE_APP_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""App recompute baseline for app %s failed: child task in use"", Name);
+        CS_AppData.HkPacket.Payload.CmdErrCounter++;
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_EnableNameAppCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_EnableNameAppCmd(const CS_EnableNameAppCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_App_Table_Entry_t *ResultsEntry;
+    CS_Def_App_Table_Entry_t *DefinitionEntry;
+    CS_TableWrapper_t *       tw = &CS_AppData.Tbl[CS_ChecksumType_APP_TABLE];
+    char                      Name[OS_MAX_API_NAME];
+
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        strncpy(Name, CmdPtr->Payload.Name, sizeof(Name) - 1);
+        Name[sizeof(Name) - 1] = '\0';
+
+        if (CS_GetAppResTblEntryByName(&ResultsEntry, Name))
+        {
+            ResultsEntry->State = CS_ChecksumState_ENABLED;
+
+            CFE_EVS_SendEvent(CS_ENABLE_APP_NAME_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Checksumming of app %s is Enabled"", Name);
+
+            if (CS_GetAppDefTblEntryByName(&DefinitionEntry, Name))
+            {
+                CS_SetDefEntryState(tw, DefinitionEntry, CS_ChecksumState_ENABLED);
+            }
+            else
+            {
+                CFE_EVS_SendEvent(CS_ENABLE_APP_DEF_NOT_FOUND_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""CS unable to update apps definition table for entry %s"", Name);
+            }
+
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+        else
+        {
+            CFE_EVS_SendEvent(CS_ENABLE_APP_UNKNOWN_NAME_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""App enable app command failed, app %s not found"", Name);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end InProgress if */
+
+    return CFE_SUCCESS;
+}"
+CS_DisableNameAppCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_DisableNameAppCmd(const CS_DisableNameAppCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    CS_Res_App_Table_Entry_t *ResultsEntry;
+    CS_Def_App_Table_Entry_t *DefinitionEntry;
+    CS_TableWrapper_t *       tw = &CS_AppData.Tbl[CS_ChecksumType_APP_TABLE];
+    char                      Name[OS_MAX_API_NAME];
+
+    if (CS_CheckRecomputeOneshot() == false)
+    {
+        strncpy(Name, CmdPtr->Payload.Name, sizeof(Name) - 1);
+        Name[sizeof(Name) - 1] = '\0';
+
+        if (CS_GetAppResTblEntryByName(&ResultsEntry, Name))
+        {
+            ResultsEntry->State             = CS_ChecksumState_DISABLED;
+            ResultsEntry->TempChecksumValue = 0;
+            ResultsEntry->ByteOffset        = 0;
+
+            CFE_EVS_SendEvent(CS_DISABLE_APP_NAME_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Checksumming of app %s is Disabled"", Name);
+
+            if (CS_GetAppDefTblEntryByName(&DefinitionEntry, Name))
+            {
+                CS_SetDefEntryState(tw, DefinitionEntry, CS_ChecksumState_DISABLED);
+            }
+            else
+            {
+                CFE_EVS_SendEvent(CS_DISABLE_APP_DEF_NOT_FOUND_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""CS unable to update apps definition table for entry %s"", Name);
+            }
+
+            CS_AppData.HkPacket.Payload.CmdCounter++;
+        }
+
+        else
+        {
+            CFE_EVS_SendEvent(CS_DISABLE_APP_UNKNOWN_NAME_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""App disable app command failed, app %s not found"", Name);
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+        }
+    } /* end InProgress if */
+
+    return CFE_SUCCESS;
+}"
+CS_ProcessCmd,"void CS_ProcessCmd(const CFE_SB_Buffer_t *BufPtr)
+{
+    CFE_SB_MsgId_t MessageID   = CFE_SB_INVALID_MSG_ID;
+    uint16         CommandCode = 0;
+
+    CFE_MSG_GetFcnCode(&BufPtr->Msg, &CommandCode);
+
+    switch (CommandCode)
+    {
+        /*  All CS Commands */
+        case CS_NOOP_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_NoopCmd_t)))
+            {
+                CS_NoopCmd((const CS_NoopCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_RESET_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_ResetCmd_t)))
+            {
+                CS_ResetCmd((const CS_ResetCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_ONE_SHOT_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_OneShotCmd_t)))
+            {
+                CS_OneShotCmd((const CS_OneShotCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_CANCEL_ONE_SHOT_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_CancelOneShotCmd_t)))
+            {
+                CS_CancelOneShotCmd((const CS_CancelOneShotCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_ENABLE_ALL_CS_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableAllCSCmd_t)))
+            {
+                CS_EnableAllCSCmd((const CS_EnableAllCSCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_ALL_CS_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableAllCSCmd_t)))
+            {
+                CS_DisableAllCSCmd((const CS_DisableAllCSCmd_t *)BufPtr);
+            }
+            break;
+
+        /* cFE core Commands */
+        case CS_ENABLE_CFE_CORE_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableCfeCoreCmd_t)))
+            {
+                CS_EnableCfeCoreCmd((const CS_EnableCfeCoreCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_CFE_CORE_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableCfeCoreCmd_t)))
+            {
+                CS_DisableCfeCoreCmd((const CS_DisableCfeCoreCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_REPORT_BASELINE_CFE_CORE_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_ReportBaselineCfeCoreCmd_t)))
+            {
+                CS_ReportBaselineCfeCoreCmd((const CS_ReportBaselineCfeCoreCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_RECOMPUTE_BASELINE_CFE_CORE_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_RecomputeBaselineCfeCoreCmd_t)))
+            {
+                CS_RecomputeBaselineCfeCoreCmd((const CS_RecomputeBaselineCfeCoreCmd_t *)BufPtr);
+            }
+            break;
+
+        /* OS Commands*/
+        case CS_ENABLE_OS_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableOSCmd_t)))
+            {
+                CS_EnableOSCmd((const CS_EnableOSCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_OS_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableOSCmd_t)))
+            {
+                CS_DisableOSCmd((const CS_DisableOSCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_REPORT_BASELINE_OS_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_ReportBaselineOSCmd_t)))
+            {
+                CS_ReportBaselineOSCmd((const CS_ReportBaselineOSCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_RECOMPUTE_BASELINE_OS_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_RecomputeBaselineOSCmd_t)))
+            {
+                CS_RecomputeBaselineOSCmd((const CS_RecomputeBaselineOSCmd_t *)BufPtr);
+            }
+            break;
+
+        /* EEPROM Commands */
+        case CS_ENABLE_EEPROM_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableEepromCmd_t)))
+            {
+                CS_EnableEepromCmd((const CS_EnableEepromCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_EEPROM_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableEepromCmd_t)))
+            {
+                CS_DisableEepromCmd((const CS_DisableEepromCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_REPORT_BASELINE_ENTRY_ID_EEPROM_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_ReportBaselineEntryIDEepromCmd_t)))
+            {
+                CS_ReportBaselineEntryIDEepromCmd((const CS_ReportBaselineEntryIDEepromCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_RECOMPUTE_BASELINE_EEPROM_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_RecomputeBaselineEepromCmd_t)))
+            {
+                CS_RecomputeBaselineEepromCmd((const CS_RecomputeBaselineEepromCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_ENABLE_ENTRY_ID_EEPROM_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableEntryIDEepromCmd_t)))
+            {
+                CS_EnableEntryIDEepromCmd((const CS_EnableEntryIDEepromCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_ENTRY_ID_EEPROM_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableEntryIDEepromCmd_t)))
+            {
+                CS_DisableEntryIDEepromCmd((const CS_DisableEntryIDEepromCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_GET_ENTRY_ID_EEPROM_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_GetEntryIDEepromCmd_t)))
+            {
+                CS_GetEntryIDEepromCmd((const CS_GetEntryIDEepromCmd_t *)BufPtr);
+            }
+            break;
+
+        /*  Memory Commands */
+        case CS_ENABLE_MEMORY_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableMemoryCmd_t)))
+            {
+                CS_EnableMemoryCmd((const CS_EnableMemoryCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_MEMORY_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableMemoryCmd_t)))
+            {
+                CS_DisableMemoryCmd((const CS_DisableMemoryCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_REPORT_BASELINE_ENTRY_ID_MEMORY_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_ReportBaselineEntryIDMemoryCmd_t)))
+            {
+                CS_ReportBaselineEntryIDMemoryCmd((const CS_ReportBaselineEntryIDMemoryCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_RECOMPUTE_BASELINE_MEMORY_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_RecomputeBaselineMemoryCmd_t)))
+            {
+                CS_RecomputeBaselineMemoryCmd((const CS_RecomputeBaselineMemoryCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_ENABLE_ENTRY_ID_MEMORY_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableEntryIDMemoryCmd_t)))
+            {
+                CS_EnableEntryIDMemoryCmd((const CS_EnableEntryIDMemoryCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_ENTRY_ID_MEMORY_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableEntryIDMemoryCmd_t)))
+            {
+                CS_DisableEntryIDMemoryCmd((const CS_DisableEntryIDMemoryCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_GET_ENTRY_ID_MEMORY_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_GetEntryIDMemoryCmd_t)))
+            {
+                CS_GetEntryIDMemoryCmd((const CS_GetEntryIDMemoryCmd_t *)BufPtr);
+            }
+            break;
+
+        /* Tables Commands */
+        case CS_ENABLE_TABLES_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableTablesCmd_t)))
+            {
+                CS_EnableTablesCmd((const CS_EnableTablesCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_TABLES_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableTablesCmd_t)))
+            {
+                CS_DisableTablesCmd((const CS_DisableTablesCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_REPORT_BASELINE_TABLE_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_ReportBaselineTableCmd_t)))
+            {
+                CS_ReportBaselineTableCmd((const CS_ReportBaselineTableCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_RECOMPUTE_BASELINE_TABLE_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_RecomputeBaselineTableCmd_t)))
+            {
+                CS_RecomputeBaselineTableCmd((const CS_RecomputeBaselineTableCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_ENABLE_NAME_TABLE_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableNameTableCmd_t)))
+            {
+                CS_EnableNameTableCmd((const CS_EnableNameTableCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_NAME_TABLE_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableNameTableCmd_t)))
+            {
+                CS_DisableNameTableCmd((const CS_DisableNameTableCmd_t *)BufPtr);
+            }
+            break;
+
+        /* App Commands */
+        case CS_ENABLE_APPS_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableAppsCmd_t)))
+            {
+                CS_EnableAppsCmd((const CS_EnableAppsCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_APPS_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableAppsCmd_t)))
+            {
+                CS_DisableAppsCmd((const CS_DisableAppsCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_REPORT_BASELINE_APP_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_ReportBaselineAppCmd_t)))
+            {
+                CS_ReportBaselineAppCmd((const CS_ReportBaselineAppCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_RECOMPUTE_BASELINE_APP_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_RecomputeBaselineAppCmd_t)))
+            {
+                CS_RecomputeBaselineAppCmd((const CS_RecomputeBaselineAppCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_ENABLE_NAME_APP_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_EnableNameAppCmd_t)))
+            {
+                CS_EnableNameAppCmd((const CS_EnableNameAppCmd_t *)BufPtr);
+            }
+            break;
+
+        case CS_DISABLE_NAME_APP_CC:
+            if (CS_VerifyCmdLength(&BufPtr->Msg, sizeof(CS_DisableNameAppCmd_t)))
+            {
+                CS_DisableNameAppCmd((const CS_DisableNameAppCmd_t *)BufPtr);
+            }
+            break;
+
+        default:
+            CFE_MSG_GetMsgId(&BufPtr->Msg, &MessageID);
+            CFE_EVS_SendEvent(CS_CC_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Invalid ground command code: ID = 0x%08lX, CC = %d"",
+                              (unsigned long)CFE_SB_MsgIdToValue(MessageID), CommandCode);
+
+            CS_AppData.HkPacket.Payload.CmdErrCounter++;
+            break;
+    } /* end switch */
+}"
+CS_ComputeEepromMemory,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ComputeEepromMemory(CS_Res_EepromMemory_Table_Entry_t *ResultsEntry, uint32 *ComputedCSValue,
+                                    bool *DoneWithEntry)
+{
+    CFE_Status_t            Status;
+    CS_LocalChecksumState_t State;
+
+    Status = CFE_SUCCESS;
+
+    memset(&State, 0, sizeof(State));
+
+    State.BufferAddr = CFE_ES_MEMADDRESS_TO_PTR(ResultsEntry->StartAddress);
+    State.TotalSize  = ResultsEntry->NumBytesToChecksum;
+    State.CurrOffset = ResultsEntry->ByteOffset;
+
+    if (!CS_IsChecksumComplete(&State))
+    {
+        /* resume where left off */
+        State.ResultBuffer = ResultsEntry->TempChecksumValue;
+    }
+
+    CS_DoChecksumChunk(&State);
+
+    /* Export all values to resume next time */
+    ResultsEntry->TempChecksumValue  = State.ResultBuffer;
+    ResultsEntry->StartAddress       = (cpuaddr)State.BufferAddr;
+    ResultsEntry->ByteOffset         = State.CurrOffset;
+    ResultsEntry->NumBytesToChecksum = State.TotalSize;
+
+    /* mirror the value to the supplied register */
+    *ComputedCSValue = State.ResultBuffer;
+
+    /* Check against the previous value, if applicable */
+    Status = CS_CheckOrUpdateReference(&State, &ResultsEntry->ComputedYet, &ResultsEntry->ComparisonValue);
+
+    *DoneWithEntry = CS_IsChecksumComplete(&State);
+
+    return Status;
+}"
+CS_ComputeTables,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ComputeTables(CS_Res_Tables_Table_Entry_t *ResultsEntry, uint32 *ComputedCSValue, bool *DoneWithEntry)
+{
+    CFE_Status_t            Status;
+    CS_LocalChecksumState_t State;
+
+    memset(&State, 0, sizeof(State));
+
+    /* For tables, This size will be nonzero if we have been here before */
+    /* Note we do NOT used the cached address, only the cached size.  The address
+     * needs to come from tbl services every cycle, since it can be updated */
+    State.TotalSize = ResultsEntry->NumBytesToChecksum;
+
+    /* By the time we get here, we know we have an enabled entry */
+    Status = CS_RefreshTableData(&State, &ResultsEntry->TblHandleID, ResultsEntry->Name);
+
+    if (Status != CFE_SUCCESS || State.BufferAddr == NULL)
+    {
+        CFE_EVS_SendEvent(CS_COMPUTE_TABLES_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""CS Tables: Problem Getting table %s: Status=0x%08X"", ResultsEntry->Name,
+                          (unsigned int)Status);
+
+        memset(&State, 0, sizeof(State));
+
+        /* pass generic error to the caller, since the underlying one was logged already */
+        Status = CS_ERR_NOT_FOUND;
+    }
+    else
+    {
+        /* If the address and size has NOT changed since our last visit, resume checksumming */
+        if (ResultsEntry->StartAddress == (cpuaddr)State.BufferAddr &&
+            ResultsEntry->NumBytesToChecksum == State.TotalSize)
+        {
+            State.CurrOffset   = ResultsEntry->ByteOffset;
+            State.ResultBuffer = ResultsEntry->TempChecksumValue;
+        }
+
+        CS_DoChecksumChunk(&State);
+
+        /* mirror the value to the supplied register */
+        *ComputedCSValue = State.ResultBuffer;
+
+        /* Check against the previous value, if applicable */
+        Status = CS_CheckOrUpdateReference(&State, &ResultsEntry->ComputedYet, &ResultsEntry->ComparisonValue);
+    }
+
+    /* If we got a table address, we need to release it (always) */
+    if (State.BufferAddr != NULL)
+    {
+        /* We are done with the table for this cycle, so we need to release the address */
+        CS_ReleaseTableAddr(ResultsEntry->TblHandleID, ResultsEntry->Name);
+    }
+
+    /* Export all values to resume next time */
+    ResultsEntry->TempChecksumValue  = State.ResultBuffer;
+    ResultsEntry->StartAddress       = (cpuaddr)State.BufferAddr;
+    ResultsEntry->ByteOffset         = State.CurrOffset;
+    ResultsEntry->NumBytesToChecksum = State.TotalSize;
+
+    *DoneWithEntry = CS_IsChecksumComplete(&State);
+
+    return Status;
+}"
+CS_ComputeApp,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ComputeApp(CS_Res_App_Table_Entry_t *ResultsEntry, uint32 *ComputedCSValue, bool *DoneWithEntry)
+{
+    CFE_Status_t            Status;
+    CS_LocalChecksumState_t State;
+
+    Status = CFE_SUCCESS;
+
+    memset(&State, 0, sizeof(State));
+
+    State.BufferAddr = CFE_ES_MEMADDRESS_TO_PTR(ResultsEntry->StartAddress);
+    State.TotalSize  = ResultsEntry->NumBytesToChecksum;
+    State.CurrOffset = ResultsEntry->ByteOffset;
+
+    if (State.BufferAddr == NULL || CS_IsChecksumComplete(&State))
+    {
+        Status = CS_RefreshAppSizeAndAddr(&State, ResultsEntry->Name);
+    }
+    else
+    {
+        /* Already got address and size, resume where left off */
+        State.ResultBuffer = ResultsEntry->TempChecksumValue;
+        Status             = CFE_SUCCESS;
+    }
+
+    if (Status == CFE_SUCCESS)
+    {
+        CS_DoChecksumChunk(&State);
+
+        /* Export all values to resume next time */
+        ResultsEntry->TempChecksumValue  = State.ResultBuffer;
+        ResultsEntry->StartAddress       = (cpuaddr)State.BufferAddr;
+        ResultsEntry->ByteOffset         = State.CurrOffset;
+        ResultsEntry->NumBytesToChecksum = State.TotalSize;
+
+        /* mirror the value to the supplied register */
+        *ComputedCSValue = State.ResultBuffer;
+
+        /* Check against the previous value, if applicable */
+        Status = CS_CheckOrUpdateReference(&State, &ResultsEntry->ComputedYet, &ResultsEntry->ComparisonValue);
+    } /* end if got module id ok */
+
+    *DoneWithEntry = CS_IsChecksumComplete(&State);
+
+    return Status;
+}"
+CS_OneShotChildTask,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void CS_OneShotChildTask(void)
+{
+    uint32  NewChecksumValue        = 0;
+    size_t  NumBytesRemainingCycles = 0;
+    size_t  NumBytesThisCycle       = 0;
+    cpuaddr FirstAddrThisCycle      = 0;
+    size_t  MaxBytesPerCycle        = 0;
+
+    NewChecksumValue        = 0;
+    NumBytesRemainingCycles = CS_AppData.HkPacket.Payload.LastOneShotSize;
+    FirstAddrThisCycle      = CS_AppData.HkPacket.Payload.LastOneShotAddress;
+    MaxBytesPerCycle        = CS_AppData.HkPacket.Payload.LastOneShotMaxBytesPerCycle;
+
+    while (NumBytesRemainingCycles > 0)
+    {
+        NumBytesThisCycle = ((MaxBytesPerCycle < NumBytesRemainingCycles) ? MaxBytesPerCycle : NumBytesRemainingCycles);
+
+        NewChecksumValue = CFE_ES_CalculateCRC((void *)(FirstAddrThisCycle), NumBytesThisCycle, NewChecksumValue,
+                                               CS_DEFAULT_ALGORITHM);
+
+        /* Update the remainders for the next cycle */
+        FirstAddrThisCycle += NumBytesThisCycle;
+        NumBytesRemainingCycles -= NumBytesThisCycle;
+
+        OS_TaskDelay(CS_CHILD_TASK_DELAY);
+    }
+
+    /*Checksum Calculation is done! */
+
+    /* put the new checksum value in the baseline */
+    CS_AppData.HkPacket.Payload.LastOneShotChecksum = NewChecksumValue;
+
+    /* send event message */
+    CFE_EVS_SendEvent(CS_ONESHOT_FINISHED_INF_EID, CFE_EVS_EventType_INFORMATION,
+                      ""OneShot checksum on Address: 0x%08X, size %d completed. Checksum =  0x%08X"",
+                      (unsigned int)(CS_AppData.HkPacket.Payload.LastOneShotAddress),
+                      (unsigned int)(CS_AppData.HkPacket.Payload.LastOneShotSize),
+                      (unsigned int)(CS_AppData.HkPacket.Payload.LastOneShotChecksum));
+
+    CS_AppData.HkPacket.Payload.OneShotInProgress = false;
+    CS_AppData.ChildTaskID                        = CFE_ES_TASKID_UNDEFINED;
+
+    CFE_ES_ExitChildTask();
+}"
+CS_BackgroundEeprom,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+bool CS_BackgroundEeprom(void)
+{
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry;
+    CS_Res_EepromMemory_Table_Entry_t *LoopEntry;
+    bool                               DoneWithCycle   = false;
+    bool                               DoneWithEntry   = false;
+    uint32                             ComputedCSValue = 0;
+    int32                              Loop;
+    uint32                             EntireEepromCS;
+    CFE_Status_t                       Status;
+
+    if (CS_AppData.HkPacket.Payload.EepromCSState == CS_ChecksumState_ENABLED)
+    {
+        ResultsEntry = CS_FindEnabledEepromEntry();
+    }
+    else
+    {
+        ResultsEntry = NULL;
+    }
+
+    if (ResultsEntry != NULL)
+    {
+        /* we found an enabled entry to checksum */
+        /* If we complete an entry's checksum, this function will update it for us */
+        Status = CS_ComputeEepromMemory(ResultsEntry, &ComputedCSValue, &DoneWithEntry);
+
+        /* We need to avoid the case of finishing a table, moving on to the next one
+            and computing an entry in that table, since it could put us above the
+            maximum bytes per cycle */
+        DoneWithCycle = true;
+
+        if (Status == CS_ERROR)
+        {
+            /* we had a miscompare */
+
+            CS_AppData.HkPacket.Payload.EepromCSErrCounter++;
+
+            CFE_EVS_SendEvent(CS_EEPROM_MISCOMPARE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Checksum Failure: Address 0x%lx in EEPROM Table, Expected: 0x%08X, Calculated: 0x%08X"",
+                              (unsigned long)ResultsEntry->StartAddress, (unsigned int)(ResultsEntry->ComparisonValue),
+                              (unsigned int)ComputedCSValue);
+        }
+
+        if (DoneWithEntry)
+        {
+            CS_AppData.HkPacket.Payload.CurrentEntryInTable++;
+        }
+    }
+
+    if (CS_AppData.HkPacket.Payload.CurrentEntryInTable >= CS_MAX_NUM_EEPROM_TABLE_ENTRIES)
+    {
+        /* Since we are done CS'ing the entire EEPROM table, update the baseline
+            number for telemetry */
+        EntireEepromCS = 0;
+        Loop           = 0;
+        while (true)
+        {
+            LoopEntry = CS_GetEepromResEntry(Loop);
+            if (LoopEntry == NULL)
+            {
+                break;
+            }
+
+            EntireEepromCS += LoopEntry->ComparisonValue;
+            ++Loop;
+        }
+
+        CS_AppData.HkPacket.Payload.EepromBaseline = EntireEepromCS;
+    }
+
+    if (ResultsEntry == NULL || CS_AppData.HkPacket.Payload.CurrentEntryInTable >= CS_MAX_NUM_EEPROM_TABLE_ENTRIES)
+    {
+        /* We are done with this table */
+        CS_GoToNextTable();
+    }
+
+    return DoneWithCycle;
+}"
+CS_RecomputeEepromMemoryChildTask,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void CS_RecomputeEepromMemoryChildTask(void)
+{
+    uint32                             NewChecksumValue = 0;
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry     = NULL;
+    uint16                             EntryID          = 0;
+    CS_ChecksumState_Enum_t            PreviousState    = CS_ChecksumState_EMPTY;
+    bool                               DoneWithEntry    = false;
+    CS_ChecksumState_Enum_t            PreviousDefState = CS_ChecksumState_EMPTY;
+    CS_Def_EepromMemory_Table_Entry_t *DefEntry         = NULL;
+    CS_TableWrapper_t *                tw;
+
+    tw           = &CS_AppData.Tbl[CS_AppData.ChildTaskTable];
+    EntryID      = CS_AppData.ChildTaskEntryID;
+    ResultsEntry = CS_AppData.RecomputeEepromMemoryEntryPtr;
+
+    /* we want to  make sure that the entry isn't being checksummed in the
+     background at the same time we are recomputing */
+    PreviousState       = ResultsEntry->State;
+    ResultsEntry->State = CS_ChecksumState_DISABLED;
+
+    /* Set entry as if this is the first time we are computing the checksum,
+       since we want the entry to take on the new value */
+
+    ResultsEntry->ByteOffset        = 0;
+    ResultsEntry->TempChecksumValue = 0;
+    ResultsEntry->ComputedYet       = false;
+
+    /* Update the definition table entry as well.  We need to determine which memory type is
+       being updated as well as which entry in the table is being updated. */
+    if (CS_CheckTableId(tw, CS_ChecksumType_EEPROM_TABLE) || CS_CheckTableId(tw, CS_ChecksumType_MEMORY_TABLE))
+    {
+        DefEntry = CS_GetDefEntryAddr(tw, EntryID);
+    }
+
+    if (DefEntry != NULL && ResultsEntry->StartAddress == DefEntry->StartAddress)
+    {
+        PreviousDefState = CS_SetDefEntryState(tw, DefEntry, CS_ChecksumState_DISABLED);
+    }
+    else
+    {
+        DefEntry = NULL;
+    }
+
+    while (!DoneWithEntry)
+    {
+        CS_ComputeEepromMemory(ResultsEntry, &NewChecksumValue, &DoneWithEntry);
+
+        OS_TaskDelay(CS_CHILD_TASK_DELAY);
+    }
+
+    /* The new checksum value is stored in the table by the above functions */
+
+    /* restore the entry's previous state */
+    ResultsEntry->State = PreviousState;
+
+    /* Restore the definition table if we found one earlier */
+    if (DefEntry != NULL)
+    {
+        CS_SetDefEntryState(tw, DefEntry, PreviousDefState);
+    }
+
+    /* Update reported value in HK TLM, if applicable */
+    if (tw->BaselineValue)
+    {
+        *tw->BaselineValue = NewChecksumValue;
+    }
+
+    /* send event message */
+    CFE_EVS_SendEvent(CS_RECOMPUTE_FINISH_EEPROM_MEMORY_INF_EID, CFE_EVS_EventType_INFORMATION,
+                      ""%s entry %d recompute finished. New baseline is 0X%08X"", CS_GetTableTypeAsString(tw), EntryID,
+                      (unsigned int)NewChecksumValue);
+
+    CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+    CFE_ES_ExitChildTask();
+}"
+CS_BackgroundOS,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+bool CS_BackgroundOS(void)
+{
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry;
+    bool                               DoneWithCycle   = false;
+    bool                               DoneWithEntry   = false;
+    uint32                             ComputedCSValue = 0;
+    CFE_Status_t                       Status;
+
+    if (CS_AppData.HkPacket.Payload.OSCSState == CS_ChecksumState_ENABLED)
+    {
+        ResultsEntry = CS_GetOSCodeSegResTable();
+
+        /* Check if the code segment state is enabled (could be disabled for
+         a ground-commanded recompute) */
+        if (ResultsEntry->State == CS_ChecksumState_ENABLED)
+        {
+            /* If we complete an entry's checksum, this function will update it for us */
+            Status = CS_ComputeEepromMemory(ResultsEntry, &ComputedCSValue, &DoneWithEntry);
+
+            /* We need to avoid the case of finishing a table, moving on to the next one
+             and computing an entry in that table, since it could put us above the
+             maximum bytes per cycle */
+            DoneWithCycle = true;
+
+            if (Status == CS_ERROR)
+            {
+                /* we had a miscompare */
+                CS_AppData.HkPacket.Payload.OSCSErrCounter++;
+
+                CFE_EVS_SendEvent(CS_OS_MISCOMPARE_ERR_EID, CFE_EVS_EventType_ERROR,
+                                  ""Checksum Failure: OS code segment, Expected: 0x%08X, Calculated: 0x%08X"",
+                                  (unsigned int)(ResultsEntry->ComparisonValue), (unsigned int)ComputedCSValue);
+            }
+
+            if (DoneWithEntry == true)
+            {
+                CS_AppData.HkPacket.Payload.CurrentEntryInTable++;
+            }
+
+            /* only one entry to do */
+            if (CS_AppData.HkPacket.Payload.CurrentEntryInTable > 0)
+            {
+                /* We are done with this table */
+                CS_AppData.HkPacket.Payload.OSBaseline = ResultsEntry->ComparisonValue;
+                CS_GoToNextTable();
+            }
+        }
+        else
+        {
+            /* Currently disabled, so skip it */
+            CS_GoToNextTable();
+        }
+    }
+    else /* Table is disabled, skip it */
+    {
+        CS_GoToNextTable();
+    }
+    return DoneWithCycle;
+}"
+CS_BackgroundCfeCore,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+bool CS_BackgroundCfeCore(void)
+{
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry;
+    bool                               DoneWithCycle   = false;
+    bool                               DoneWithEntry   = false;
+    uint32                             ComputedCSValue = 0;
+    CFE_Status_t                       Status;
+
+    if (CS_AppData.HkPacket.Payload.CfeCoreCSState == CS_ChecksumState_ENABLED)
+    {
+        ResultsEntry = CS_GetCfeCoreCodeSegResTable();
+
+        /* Check if the code segment state is enabled (could be disabled for
+           a ground-commanded recompute) */
+        if (ResultsEntry->State == CS_ChecksumState_ENABLED)
+        {
+            /* If we complete an entry's checksum, this function will update it for us */
+            Status = CS_ComputeEepromMemory(ResultsEntry, &ComputedCSValue, &DoneWithEntry);
+
+            /* We need to avoid the case of finishing a table, moving on to the next one
+             and computing an entry in that table, since it could put us above the
+             maximum bytes per cycle */
+            DoneWithCycle = true;
+
+            if (Status == CS_ERROR)
+            {
+                /* we had a miscompare */
+
+                CS_AppData.HkPacket.Payload.CfeCoreCSErrCounter++;
+
+                CFE_EVS_SendEvent(CS_CFECORE_MISCOMPARE_ERR_EID, CFE_EVS_EventType_ERROR,
+                                  ""Checksum Failure: cFE Core, Expected: 0x%08X, Calculated: 0x%08X"",
+                                  (unsigned int)(ResultsEntry->ComparisonValue), (unsigned int)ComputedCSValue);
+            }
+
+            if (DoneWithEntry == true)
+            {
+                CS_AppData.HkPacket.Payload.CurrentEntryInTable++;
+            }
+
+            /* only one entry to do */
+            if (CS_AppData.HkPacket.Payload.CurrentEntryInTable > 0)
+            {
+                /* We are done with this table */
+                CS_AppData.HkPacket.Payload.CfeCoreBaseline = ResultsEntry->ComparisonValue;
+                CS_GoToNextTable();
+            }
+        }
+        else
+        {
+            /* Currently disabled, so skip it */
+            CS_GoToNextTable();
+        }
+    }
+    else /* Table is disabled, skip it */
+    {
+        CS_GoToNextTable();
+    }
+
+    return DoneWithCycle;
+}"
+CS_BackgroundCheckCycleCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_BackgroundCheckCycleCmd(const CS_BackgroundCheckCycleCmd_t *CmdPtr)
+{
+    /* command verification variables */
+    bool DoneWithCycle = false;
+    bool EndOfList     = false;
+
+    if (CS_AppData.HkPacket.Payload.ChecksumState == CS_ChecksumState_ENABLED)
+    {
+        DoneWithCycle = false;
+        EndOfList     = false;
+
+        /* Skip this background cycle if there's a recompute or one shot in
+         * progress */
+        if (CS_AppData.HkPacket.Payload.RecomputeInProgress == true ||
+            CS_AppData.HkPacket.Payload.OneShotInProgress == true)
+        {
+            CFE_EVS_SendEvent(CS_BKGND_COMPUTE_PROG_INF_EID, CFE_EVS_EventType_INFORMATION,
+                              ""Skipping background cycle. Recompute or oneshot in progress."");
+            DoneWithCycle = true;
+        }
+
+        /* We check for end-of-list because we don't necessarily know the
+            order in which the table entries are defined, and we don't
+            want to keep looping through the list */
+
+        while ((DoneWithCycle != true) && (EndOfList != true))
+        {
+            /* We need to check the current table value here because
+                it is updated (and possibly reset to zero) inside each
+                function called */
+            if (CS_AppData.HkPacket.Payload.CurrentCSTable >= (CS_NUM_TABLES - 1))
+            {
+                EndOfList = true;
+            }
+
+            /* Call the appropriate background function based on the current table
+                value.  The value is updated inside each function */
+            switch (CS_AppData.HkPacket.Payload.CurrentCSTable)
+            {
+                case (CS_ChecksumType_CFECORE):
+                    DoneWithCycle = CS_BackgroundCfeCore();
+                    break;
+
+                case (CS_ChecksumType_OSCORE):
+
+                    DoneWithCycle = CS_BackgroundOS();
+                    break;
+
+                case (CS_ChecksumType_EEPROM_TABLE):
+                    DoneWithCycle = CS_BackgroundEeprom();
+                    break;
+
+                case (CS_ChecksumType_MEMORY_TABLE):
+                    DoneWithCycle = CS_BackgroundMemory();
+                    break;
+
+                case (CS_ChecksumType_TABLES_TABLE):
+                    DoneWithCycle = CS_BackgroundTables();
+                    break;
+
+                case (CS_ChecksumType_APP_TABLE):
+
+                    DoneWithCycle = CS_BackgroundApp();
+                    break;
+
+                    /* default case in case CS_AppData.HkPacket.Payload.CurrentCSTable is some random bad value */
+                default:
+
+                    /* We are at the end of the line */
+                    CS_AppData.HkPacket.Payload.CurrentCSTable      = 0;
+                    CS_AppData.HkPacket.Payload.CurrentEntryInTable = 0;
+                    CS_AppData.HkPacket.Payload.PassCounter++;
+                    DoneWithCycle = true;
+                    break;
+
+            } /* end switch */
+        }     /* end while */
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_BackgroundTables,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+bool CS_BackgroundTables(void)
+{
+    CS_Res_Tables_Table_Entry_t *TablesResultsEntry;
+    bool                         DoneWithCycle   = false;
+    bool                         DoneWithEntry   = false;
+    uint32                       ComputedCSValue = 0;
+    CFE_Status_t                 Status;
+
+    if (CS_AppData.HkPacket.Payload.TablesCSState == CS_ChecksumState_ENABLED)
+    {
+        /* If we complete an entry's checksum, this function will update it for us */
+        TablesResultsEntry = CS_FindEnabledTablesEntry();
+    }
+    else
+    {
+        TablesResultsEntry = NULL;
+    }
+
+    if (TablesResultsEntry != NULL)
+    {
+        /* we found an enabled entry to checksum */
+        Status = CS_ComputeTables(TablesResultsEntry, &ComputedCSValue, &DoneWithEntry);
+
+        /* We need to avoid the case of finishing a table, moving on to the next one
+            and computing an entry in that table, since  it could put us above the
+            maximum bytes per cycle */
+        DoneWithCycle = true;
+
+        if (Status == CS_ERROR)
+        {
+            /* we had a miscompare */
+            CS_AppData.HkPacket.Payload.TablesCSErrCounter++;
+
+            CFE_EVS_SendEvent(CS_TABLES_MISCOMPARE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Checksum Failure: Table %s, Expected: 0x%08X, Calculated: 0x%08X"",
+                              TablesResultsEntry->Name, (unsigned int)(TablesResultsEntry->ComparisonValue),
+                              (unsigned int)ComputedCSValue);
+        }
+
+        if (Status == CS_ERR_NOT_FOUND)
+        {
+            CFE_EVS_SendEvent(CS_COMPUTE_TABLES_NOT_FOUND_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Tables table computing: Table %s could not be found, skipping"",
+                              TablesResultsEntry->Name);
+
+            DoneWithEntry = true;
+        }
+
+        if (DoneWithEntry)
+        {
+            CS_AppData.HkPacket.Payload.CurrentEntryInTable++;
+        }
+    }
+
+    if (TablesResultsEntry == NULL ||
+        CS_AppData.HkPacket.Payload.CurrentEntryInTable >= CS_MAX_NUM_TABLES_TABLE_ENTRIES)
+    {
+        /* We are done with this table */
+        CS_GoToNextTable();
+    }
+
+    return DoneWithCycle;
+}"
+CS_HandleRoutineTableUpdates,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_HandleRoutineTableUpdates(void)
+{
+    CFE_Status_t       Result = CFE_SUCCESS;
+    uint16             TableId;
+    CS_TableWrapper_t *tw;
+    bool               ShouldProcess;
+
+    static const uint16 EventIdMap[CS_NUM_TABLES] = {
+        [CS_ChecksumType_EEPROM_TABLE] = CS_UPDATE_EEPROM_ERR_EID,
+        [CS_ChecksumType_MEMORY_TABLE] = CS_UPDATE_MEMORY_ERR_EID,
+        [CS_ChecksumType_TABLES_TABLE] = CS_UPDATE_TABLES_ERR_EID,
+        [CS_ChecksumType_APP_TABLE]    = CS_UPDATE_APP_ERR_EID,
+    };
+
+    for (TableId = 0; TableId < CS_NUM_TABLES; ++TableId)
+    {
+        tw = &CS_AppData.Tbl[TableId];
+
+        if (tw->DefEntrySize == 0)
+        {
+            /* There is no table to update */
+            ShouldProcess = false;
+        }
+        else if (!CS_AppData.HkPacket.Payload.RecomputeInProgress || CS_AppData.HkPacket.Payload.OneShotInProgress)
+        {
+            /* Always update */
+            ShouldProcess = true;
+        }
+        else
+        {
+            /* Do not process if the child task owns this table */
+            ShouldProcess = (CS_AppData.ChildTaskTable != TableId);
+        }
+
+        if (ShouldProcess)
+        {
+            Result = CS_HandleTableUpdate(tw);
+        }
+        else
+        {
+            Result = CFE_SUCCESS;
+        }
+
+        if (Result != CFE_SUCCESS)
+        {
+            CFE_EVS_SendEvent(EventIdMap[TableId], CFE_EVS_EventType_ERROR,
+                              ""Table update failed for %s: 0x%08X, checksumming is disabled"",
+                              CS_GetTableTypeAsString(tw), (unsigned int)Result);
+
+            if (tw->GlobalState)
+            {
+                *tw->GlobalState = CS_ChecksumState_DISABLED;
+            }
+        }
+    }
+
+    return CFE_SUCCESS;
+}"
+CS_HandleTableUpdate,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_HandleTableUpdate(CS_TableWrapper_t *tw)
+{
+    CFE_Status_t ReleaseResult1 = CFE_SUCCESS;
+    CFE_Status_t ManageResult1  = CFE_SUCCESS;
+    CFE_Status_t GetResult1     = CFE_SUCCESS;
+    CFE_Status_t ReleaseResult2 = CFE_SUCCESS;
+    CFE_Status_t ManageResult2  = CFE_SUCCESS;
+    CFE_Status_t GetResult2     = CFE_SUCCESS;
+    CFE_Status_t Result         = CFE_SUCCESS;
+    int32        Loop           = 0;
+
+    CFE_TBL_Handle_t             LocalHandle;
+    CS_Res_Tables_Table_Entry_t *ResTablesTblPtr;
+
+    /* Below, there are several values that are returned and assigned, but never evaluated. */
+    /* This is done so intentionally, as it helps us with Source-Level debugging this functions. */
+
+    /* Release the Table Address.  */
+    ReleaseResult1 = CFE_TBL_ReleaseAddress(tw->ResHandle);
+    ReleaseResult2 = CFE_TBL_ReleaseAddress(tw->DefHandle);
+
+    ManageResult1 = CFE_TBL_Manage(tw->ResHandle);
+    ManageResult2 = CFE_TBL_Manage(tw->DefHandle);
+
+    GetResult1 = CFE_TBL_GetAddress(&tw->ResAddr, tw->ResHandle);
+    Result     = GetResult1;
+
+    if (Result >= CFE_SUCCESS)
+    {
+        GetResult2 = CFE_TBL_GetAddress(&tw->DefAddr, tw->DefHandle);
+        Result     = GetResult2;
+    }
+
+    if ((Result == CFE_TBL_INFO_UPDATED))
+    {
+        if (CS_CheckTableId(tw, CS_ChecksumType_TABLES_TABLE))
+        {
+            /* before we update the results table, we need to release all of the
+             table handles that are in the results table */
+            Loop = 0;
+            while (true)
+            {
+                ResTablesTblPtr = CS_GetTablesResEntry(Loop);
+                if (ResTablesTblPtr == NULL)
+                {
+                    break;
+                }
+                if (!ResTablesTblPtr->IsCSOwner)
+                {
+                    LocalHandle = CFE_TBL_HandleFromID(ResTablesTblPtr->TblHandleID);
+                }
+                else
+                {
+                    LocalHandle = CFE_TBL_BAD_TABLE_HANDLE;
+                }
+                if (CFE_TBL_HANDLE_IS_VALID(LocalHandle))
+                {
+                    CFE_TBL_Unregister(LocalHandle);
+                }
+                ++Loop;
+            }
+        }
+
+        CS_CallTableUpdateHandler(tw);
+
+        Result = CFE_SUCCESS;
+    }
+    else
+    {
+        if (Result < CFE_SUCCESS)
+        {
+            /* There was a problem somewhere, generate an event */
+            CFE_EVS_SendEvent(CS_TBL_UPDATE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""CS had problems updating table. Res Release: 0x%08X Def Release:0x%08X Res ""
+                              ""Manage:0x%08X Def Manage: 0x%08X Get:0x%08X for table %s"",
+                              (unsigned int)ReleaseResult1, (unsigned int)ReleaseResult2, (unsigned int)ManageResult1,
+                              (unsigned int)ManageResult2, (unsigned int)GetResult2, CS_GetTableTypeAsString(tw));
+        }
+    }
+    return Result;
+}"
+CS_RecomputeAppChildTask,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void CS_RecomputeAppChildTask(void)
+{
+    uint32                    NewChecksumValue = 0;
+    CS_Res_App_Table_Entry_t *ResultsEntry     = NULL;
+    CS_ChecksumState_Enum_t   PreviousState    = CS_ChecksumState_EMPTY;
+    bool                      DoneWithEntry    = false;
+    CFE_Status_t              Status           = CS_ERROR;
+    CS_ChecksumState_Enum_t   PreviousDefState = CS_ChecksumState_EMPTY;
+    CS_Def_App_Table_Entry_t *DefTblEntry      = NULL;
+
+    CS_TableWrapper_t *tw = &CS_AppData.Tbl[CS_ChecksumType_APP_TABLE];
+
+    /* Get the variables to use from the global data */
+    ResultsEntry = CS_AppData.RecomputeAppEntryPtr;
+
+    /* we want to  make sure that the entry isn't being checksummed in the
+     background at the same time we are recomputing */
+
+    PreviousState       = ResultsEntry->State;
+    ResultsEntry->State = CS_ChecksumState_DISABLED;
+
+    /* Set entry as if this is the first time we are computing the checksum,
+       since we want the entry to take on the new value */
+
+    ResultsEntry->ByteOffset        = 0;
+    ResultsEntry->TempChecksumValue = 0;
+    ResultsEntry->ComputedYet       = false;
+
+    /* Update the definition table entry as well.  We need to determine which memory type is
+       being updated as well as which entry in the table is being updated. */
+
+    CS_GetAppDefTblEntryByName(&DefTblEntry, ResultsEntry->Name);
+
+    if (DefTblEntry != NULL)
+    {
+        PreviousDefState = CS_SetDefEntryState(tw, DefTblEntry, CS_ChecksumState_DISABLED);
+    }
+
+    while (!DoneWithEntry)
+    {
+        Status = CS_ComputeApp(ResultsEntry, &NewChecksumValue, &DoneWithEntry);
+
+        if (Status == CS_ERR_NOT_FOUND)
+        {
+            break;
+        }
+
+        OS_TaskDelay(CS_CHILD_TASK_DELAY);
+    }
+    /* The new checksum value is stored in the table by the above functions */
+
+    /* restore the entry's state */
+    ResultsEntry->State = PreviousState;
+
+    /* Restore the definition table if we found one earlier */
+    if (DefTblEntry != NULL)
+    {
+        CS_SetDefEntryState(tw, DefTblEntry, PreviousDefState);
+    }
+
+    if (Status == CS_ERR_NOT_FOUND)
+    {
+        CFE_EVS_SendEvent(CS_RECOMPUTE_ERROR_APP_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""App %s recompute failed. Could not get address"", ResultsEntry->Name);
+    }
+    else
+    {
+        /* send event message */
+        CFE_EVS_SendEvent(CS_RECOMPUTE_FINISH_APP_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""App %s recompute finished. New baseline is 0x%08X"", ResultsEntry->Name,
+                          (unsigned int)NewChecksumValue);
+    }
+
+    CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+    CFE_ES_ExitChildTask();
+}"
+CS_TableInit,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_TableInit(CS_TableWrapper_t *tw, const char *DefinitionTableFileName,
+                          CFE_TBL_CallbackFuncPtr_t CallBackFunction)
+{
+    CFE_Status_t Result;
+
+    if (DefinitionTableFileName == NULL)
+    {
+        Result = CFE_SUCCESS; /* nothing to do */
+    }
+    else
+    {
+        Result = CS_RegisterResultTable(tw);
+
+        if (Result == CFE_SUCCESS)
+        {
+            Result = CS_RegisterDefinitionTable(tw, DefinitionTableFileName, CallBackFunction);
+        }
+
+        if (Result != CFE_SUCCESS)
+        {
+            CFE_EVS_SendEvent(CS_TBL_INIT_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""CS received error 0x%08X initializing tables for %s"", (unsigned int)Result,
+                              CS_GetTableTypeAsString(tw));
+        }
+    }
+
+    return Result;
+}"
+CS_RecomputeTablesChildTask,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void CS_RecomputeTablesChildTask(void)
+{
+    uint32                       NewChecksumValue = 0;
+    CS_Res_Tables_Table_Entry_t *ResultsEntry     = NULL;
+    CS_ChecksumState_Enum_t      PreviousState    = CS_ChecksumState_EMPTY;
+    bool                         DoneWithEntry    = false;
+    CFE_Status_t                 Status           = CS_ERROR;
+    CS_ChecksumState_Enum_t      PreviousDefState = CS_ChecksumState_EMPTY;
+    CS_Def_Tables_Table_Entry_t *DefTblEntry      = NULL;
+
+    CS_TableWrapper_t *tw = &CS_AppData.Tbl[CS_ChecksumType_TABLES_TABLE];
+
+    /* Get the variables to use from the global data */
+    ResultsEntry = CS_AppData.RecomputeTablesEntryPtr;
+
+    /* we want to  make sure that the entry isn't being checksummed in the
+     background at the same time we are recomputing */
+
+    PreviousState       = ResultsEntry->State;
+    ResultsEntry->State = CS_ChecksumState_DISABLED;
+
+    /* Set entry as if this is the first time we are computing the checksum,
+     since we want the entry to take on the new value */
+
+    ResultsEntry->ByteOffset        = 0;
+    ResultsEntry->TempChecksumValue = 0;
+    ResultsEntry->ComputedYet       = false;
+
+    /* Update the definition table entry as well.  We need to determine which memory type is
+     being updated as well as which entry in the table is being updated. */
+    CS_GetTableDefTblEntryByName(&DefTblEntry, ResultsEntry->Name);
+    if (DefTblEntry != NULL)
+    {
+        PreviousDefState = CS_SetDefEntryState(tw, DefTblEntry, CS_ChecksumState_DISABLED);
+    }
+
+    while (!DoneWithEntry)
+    {
+        Status = CS_ComputeTables(ResultsEntry, &NewChecksumValue, &DoneWithEntry);
+
+        if (Status == CS_ERR_NOT_FOUND)
+        {
+            break;
+        }
+
+        OS_TaskDelay(CS_CHILD_TASK_DELAY);
+    }
+
+    /* The new checksum value is stored in the table by the above functions */
+    if (Status == CS_ERR_NOT_FOUND)
+    {
+        CFE_EVS_SendEvent(CS_RECOMPUTE_ERROR_TABLES_ERR_EID, CFE_EVS_EventType_ERROR,
+                          ""Table %s recompute failed. Could not get address"", ResultsEntry->Name);
+    }
+    else
+    {
+        /* send event message */
+        CFE_EVS_SendEvent(CS_RECOMPUTE_FINISH_TABLES_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""Table %s recompute finished. New baseline is 0x%08X"", ResultsEntry->Name,
+                          (unsigned int)NewChecksumValue);
+    }
+
+    /* restore the entry's state */
+    ResultsEntry->State = PreviousState;
+
+    /* Restore the definition table if we found one earlier */
+    if (DefTblEntry != NULL)
+    {
+        CS_SetDefEntryState(tw, DefTblEntry, PreviousDefState);
+    }
+
+    CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+    CFE_ES_ExitChildTask();
+}"
+CS_GetAppResTblEntryByName,"/* make sure the entry is a valid number and is defined in the table */
+        if (CS_GetAppResTblEntryByName(&ResultsEntry, Name))
+        {
+            /* There is no child task running right now, we can use it*/
+            CS_AppData.HkPacket.Payload.RecomputeInProgress = true;
+
+            /* fill in child task variables */
+            CS_AppData.ChildTaskTable = CS_ChecksumType_APP_TABLE;
+
+            CS_AppData.RecomputeAppEntryPtr = ResultsEntry;
+
+            Status = CFE_ES_CreateChildTask(&ChildTaskID, CS_RECOMP_APP_TASK_NAME, CS_RecomputeAppChildTask, NULL,
+                                            CFE_PLATFORM_ES_DEFAULT_STACK_SIZE, CS_CHILD_TASK_PRIORITY, 0);
+            if (Status == CFE_SUCCESS)
+            {
+                CFE_EVS_SendEvent(CS_RECOMPUTE_APP_STARTED_DBG_EID, CFE_EVS_EventType_DEBUG,
+                                  ""Recompute baseline of app %s started"", Name);
+                CS_AppData.HkPacket.Payload.CmdCounter++;
+            }
+            else /* child task creation failed */
+            {
+                CFE_EVS_SendEvent(CS_RECOMPUTE_APP_CREATE_CHDTASK_ERR_EID, CFE_EVS_EventType_ERROR,
+                                  ""Recompute baseline of app %s failed, CFE_ES_CreateChildTask returned: 0x%08X"", Name,
+                                  (unsigned int)Status);
+                CS_AppData.HkPacket.Payload.CmdErrCounter++;
+                CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+            }
+        }"
+CS_BackgroundMemory,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+bool CS_BackgroundMemory(void)
+{
+    CS_Res_EepromMemory_Table_Entry_t *ResultsEntry;
+    bool                               DoneWithCycle   = false;
+    bool                               DoneWithEntry   = false;
+    uint32                             ComputedCSValue = 0;
+    CFE_Status_t                       Status;
+
+    if (CS_AppData.HkPacket.Payload.MemoryCSState == CS_ChecksumState_ENABLED)
+    {
+        /* If we complete an entry's checksum, this function will update it for us */
+        ResultsEntry = CS_FindEnabledMemoryEntry();
+    }
+    else
+    {
+        ResultsEntry = NULL;
+    }
+
+    if (ResultsEntry != NULL)
+    {
+        /* we found an enabled entry to checksum */
+        /* If we complete an entry's checksum, this function will update it for us */
+        Status = CS_ComputeEepromMemory(ResultsEntry, &ComputedCSValue, &DoneWithEntry);
+
+        /* We need to avoid the case of finishing a table, moving on to the next one
+            and computing an entry in that table, since it could put us above the
+            maximum bytes per cycle */
+        DoneWithCycle = true;
+
+        if (Status == CS_ERROR)
+        {
+            /* we had a miscompare */
+
+            CS_AppData.HkPacket.Payload.MemoryCSErrCounter++;
+
+            CFE_EVS_SendEvent(CS_MEMORY_MISCOMPARE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Checksum Failure: Address 0x%lx in Memory Table, Expected: 0x%08X, Calculated: 0x%08X"",
+                              (unsigned long)ResultsEntry->StartAddress, (unsigned int)(ResultsEntry->ComparisonValue),
+                              (unsigned int)ComputedCSValue);
+        }
+
+        if (DoneWithEntry)
+        {
+            CS_AppData.HkPacket.Payload.CurrentEntryInTable++;
+        }
+    }
+
+    if (ResultsEntry == NULL || CS_AppData.HkPacket.Payload.CurrentEntryInTable >= CS_MAX_NUM_MEMORY_TABLE_ENTRIES)
+    {
+        /* We are done with this table */
+        CS_GoToNextTable();
+    }
+
+    return DoneWithCycle;
+}"
+CS_SendHkCmd,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_SendHkCmd(const CS_SendHkCmd_t *CmdPtr)
+{
+    /* Send housekeeping telemetry packet */
+    CFE_SB_TimeStampMsg(CFE_MSG_PTR(CS_AppData.HkPacket.TelemetryHeader));
+    CFE_SB_TransmitMsg(CFE_MSG_PTR(CS_AppData.HkPacket.TelemetryHeader), true);
+
+    /* update each table if there is no recompute happening on that table */
+    CS_HandleRoutineTableUpdates();
+
+    return CFE_SUCCESS;
+}"
+CS_AppInit,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_AppInit(void)
+{
+    CFE_Status_t Result = CFE_SUCCESS;
+
+    /* Register for event services */
+    Result = CFE_EVS_Register(NULL, 0, 0);
+
+    if (Result != CFE_SUCCESS)
+    {
+        CFE_ES_WriteToSysLog(""CS App: Error Registering For Event Services, RC = 0x%08X\n"", (unsigned int)Result);
+    }
+    else
+    {
+        /* Zero out all data in CS_AppData, including the housekeeping data*/
+        memset(&CS_AppData, 0, sizeof(CS_AppData));
+
+        CS_AppData.RunStatus = CFE_ES_RunStatus_APP_RUN;
+
+        Result = CS_SbInit();
+    }
+
+    if (Result == CFE_SUCCESS)
+    {
+        /* Set up default tables in memory */
+        CS_InitializeDefaultTables();
+
+        CS_AppData.HkPacket.Payload.EepromCSState = CS_EEPROM_TBL_POWERON_STATE;
+        CS_AppData.HkPacket.Payload.MemoryCSState = CS_MEMORY_TBL_POWERON_STATE;
+        CS_AppData.HkPacket.Payload.AppCSState    = CS_APPS_TBL_POWERON_STATE;
+        CS_AppData.HkPacket.Payload.TablesCSState = CS_TABLES_TBL_POWERON_STATE;
+
+        CS_AppData.HkPacket.Payload.OSCSState      = CS_OSCS_CHECKSUM_STATE;
+        CS_AppData.HkPacket.Payload.CfeCoreCSState = CS_CFECORE_CHECKSUM_STATE;
+
+#if (CS_PRESERVE_STATES_ON_PROCESSOR_RESET == true)
+        Result = CS_CreateRestoreStatesFromCDS();
+#endif
+    }
+
+    if (Result == CFE_SUCCESS)
+    {
+        Result = CS_InitAllTables();
+    }
+
+    if (Result == CFE_SUCCESS)
+    {
+        CS_InitSegments();
+
+        /* initialize the place to ostart background checksumming */
+        CS_AppData.HkPacket.Payload.CurrentCSTable      = 0;
+        CS_AppData.HkPacket.Payload.CurrentEntryInTable = 0;
+
+        /* Initial settings for the CS Application */
+        /* the rest of the tables are initialized in CS_TableInit */
+        CS_AppData.HkPacket.Payload.ChecksumState = CS_ChecksumState_ENABLED;
+
+        CS_AppData.HkPacket.Payload.RecomputeInProgress = false;
+        CS_AppData.HkPacket.Payload.OneShotInProgress   = false;
+
+        CS_AppData.MaxBytesPerCycle = CS_DEFAULT_BYTES_PER_CYCLE;
+
+        /* Application startup event message */
+        Result =
+            CFE_EVS_SendEvent(CS_INIT_INF_EID, CFE_EVS_EventType_INFORMATION, ""CS Initialized. Version %d.%d.%d.%d"",
+                              CS_MAJOR_VERSION, CS_MINOR_VERSION, CS_REVISION, CS_MISSION_REV);
+    }
+    return Result;
+}"
+CS_InitSegments,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+void CS_InitSegments(void)
+{
+    int32   ResultSegment = OS_SUCCESS;
+    uint32  CFESize;
+    cpuaddr CFEAddress;
+    uint32  KernelSize;
+    cpuaddr KernelAddress;
+
+    CS_Res_EepromMemory_Table_Entry_t *CodeSeg;
+
+    /* Initalize the CFE core segments */
+    ResultSegment = CFE_PSP_GetCFETextSegmentInfo(&CFEAddress, &CFESize);
+    CodeSeg       = CS_GetCfeCoreCodeSegResTable();
+
+    if (ResultSegment != OS_SUCCESS)
+    {
+        CodeSeg->StartAddress       = 0;
+        CodeSeg->NumBytesToChecksum = 0;
+        CodeSeg->ComputedYet        = false;
+        CodeSeg->ComparisonValue    = 0;
+        CodeSeg->ByteOffset         = 0;
+        CodeSeg->TempChecksumValue  = 0;
+        CodeSeg->State              = CS_ChecksumState_DISABLED;
+
+        CFE_EVS_SendEvent(CS_CFE_TEXT_SEG_INF_EID, CFE_EVS_EventType_INFORMATION, ""CFE Text Segment disabled"");
+    }
+    else
+    {
+        CodeSeg->StartAddress       = CFEAddress;
+        CodeSeg->NumBytesToChecksum = CFESize;
+        CodeSeg->ComputedYet        = false;
+        CodeSeg->ComparisonValue    = 0;
+        CodeSeg->ByteOffset         = 0;
+        CodeSeg->TempChecksumValue  = 0;
+        CodeSeg->State              = CS_ChecksumState_ENABLED;
+    }
+
+    /* Initialize the OS Core code segment*/
+
+    ResultSegment = CFE_PSP_GetKernelTextSegmentInfo(&KernelAddress, &KernelSize);
+    CodeSeg       = CS_GetOSCodeSegResTable();
+
+    if (ResultSegment != OS_SUCCESS)
+    {
+        CodeSeg->StartAddress       = 0;
+        CodeSeg->NumBytesToChecksum = 0;
+        CodeSeg->ComputedYet        = false;
+        CodeSeg->ComparisonValue    = 0;
+        CodeSeg->ByteOffset         = 0;
+        CodeSeg->TempChecksumValue  = 0;
+        CodeSeg->State              = CS_ChecksumState_DISABLED;
+
+        CFE_EVS_SendEvent(CS_OS_TEXT_SEG_INF_EID, CFE_EVS_EventType_INFORMATION,
+                          ""OS Text Segment disabled due to platform"");
+    }
+    else
+    {
+        CodeSeg->StartAddress       = KernelAddress;
+        CodeSeg->NumBytesToChecksum = KernelSize;
+        CodeSeg->ComputedYet        = false;
+        CodeSeg->ComparisonValue    = 0;
+        CodeSeg->ByteOffset         = 0;
+        CodeSeg->TempChecksumValue  = 0;
+        CodeSeg->State              = CS_ChecksumState_ENABLED;
+    }
+}"
+CS_ValidateAppChecksumDefinitionTable,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+CFE_Status_t CS_ValidateAppChecksumDefinitionTable(void *TblPtr)
+{
+    static const uint16 APP_EVENTID_MAP[CS_ValidationError_MAX] = {
+        [CS_ValidationError_NONE]      = CS_VAL_APP_INF_EID,
+        [CS_ValidationError_LONG_NAME] = CS_VAL_APP_DEF_TBL_LONG_NAME_ERR_EID,
+        [CS_ValidationError_STATE]     = CS_VAL_APP_STATE_ERR_EID,
+        [CS_ValidationError_ZERO_NAME] = CS_VAL_APP_DEF_TBL_ZERO_NAME_ERR_EID,
+        [CS_ValidationError_DUPLICATE] = CS_VAL_APP_DEF_TBL_DUPL_ERR_EID,
+    };
+
+    CS_Def_App_Table_Entry_t *Entry;
+    CS_ValidationMetrics_t    Metrics;
+
+    memset(&Metrics, 0, sizeof(Metrics));
+
+    /* These are needed for assembling event data, if necessary */
+    Metrics.TableName = ""Apps"";
+    Metrics.EventMap  = APP_EVENTID_MAP;
+
+    Entry = (CS_Def_App_Table_Entry_t *)TblPtr;
+    while (Metrics.Position < CS_MAX_NUM_APP_TABLE_ENTRIES)
+    {
+        CS_ValidationMetrics_StartNext(&Metrics, Entry->State);
+
+        CS_ValidateEntryName(&Metrics, Entry->Name, sizeof(Entry->Name));
+        if (CS_ValidationMetrics_IsCurrentOK(&Metrics) && CS_StateValid(Entry->State))
+        {
+            CS_CheckForDuplicateEntry(&Metrics, Entry->Name, sizeof(*Entry));
+        }
+
+        /* increment the respective counter for final report */
+        CS_ValidationMetrics_Accumulate(&Metrics);
+        ++Entry;
+    }
+
+    return CS_ValidationMetrics_GetFinalStatus(&Metrics);
+}"
+CS_CreateRestoreStatesFromCDS,"CFE_Status_t CS_CreateRestoreStatesFromCDS(void)
+{
+    /* Store task ena/dis state of tables in CDS */
+    uint8        DataStoreBuffer[CS_NUM_DATA_STORE_STATES];
+    CFE_Status_t Result;
+    int32        EventId = 0;
+
+    memset(DataStoreBuffer, 0, sizeof(DataStoreBuffer));
+
+    /*
+    ** Request for CDS area from cFE Executive Services...
+    */
+    Result = CFE_ES_RegisterCDS(&CS_AppData.DataStoreHandle, sizeof(DataStoreBuffer), CS_CDS_NAME);
+
+    if (Result == CFE_SUCCESS)
+    {
+        /*
+        ** New CDS area - write to Critical Data Store...
+        */
+        DataStoreBuffer[0] = CS_AppData.HkPacket.Payload.EepromCSState;
+        DataStoreBuffer[1] = CS_AppData.HkPacket.Payload.MemoryCSState;
+        DataStoreBuffer[2] = CS_AppData.HkPacket.Payload.AppCSState;
+        DataStoreBuffer[3] = CS_AppData.HkPacket.Payload.TablesCSState;
+
+        DataStoreBuffer[4] = CS_AppData.HkPacket.Payload.OSCSState;
+        DataStoreBuffer[5] = CS_AppData.HkPacket.Payload.CfeCoreCSState;
+
+        Result = CFE_ES_CopyToCDS(CS_AppData.DataStoreHandle, DataStoreBuffer);
+
+        if (Result != CFE_SUCCESS)
+        {
+            EventId = CS_CR_CDS_CPY_ERR_EID;
+        }
+    }
+    else if (Result == CFE_ES_CDS_ALREADY_EXISTS)
+    {
+        /*
+        ** Pre-existing CDS area - read from Critical Data Store...
+        */
+        Result = CFE_ES_RestoreFromCDS(DataStoreBuffer, CS_AppData.DataStoreHandle);
+
+        if (Result == CFE_SUCCESS)
+        {
+            CS_AppData.HkPacket.Payload.EepromCSState = DataStoreBuffer[0];
+            CS_AppData.HkPacket.Payload.MemoryCSState = DataStoreBuffer[1];
+            CS_AppData.HkPacket.Payload.AppCSState    = DataStoreBuffer[2];
+            CS_AppData.HkPacket.Payload.TablesCSState = DataStoreBuffer[3];
+
+            CS_AppData.HkPacket.Payload.OSCSState      = DataStoreBuffer[4];
+            CS_AppData.HkPacket.Payload.CfeCoreCSState = DataStoreBuffer[5];
+        }
+        else
+        {
+            EventId = CS_CR_CDS_RES_ERR_EID;
+        }
+    }
+    else
+    {
+        EventId = CS_CR_CDS_REG_ERR_EID;
+    }
+
+    if (Result != CFE_SUCCESS)
+    {
+        /*
+        ** CDS is broken - prevent further errors...
+        */
+        CS_AppData.DataStoreHandle = CFE_ES_CDS_BAD_HANDLE;
+
+        /* Use states from platform configuration */
+        CS_AppData.HkPacket.Payload.EepromCSState = CS_EEPROM_TBL_POWERON_STATE;
+        CS_AppData.HkPacket.Payload.MemoryCSState = CS_MEMORY_TBL_POWERON_STATE;
+        CS_AppData.HkPacket.Payload.AppCSState    = CS_APPS_TBL_POWERON_STATE;
+        CS_AppData.HkPacket.Payload.TablesCSState = CS_TABLES_TBL_POWERON_STATE;
+
+        CS_AppData.HkPacket.Payload.OSCSState      = CS_OSCS_CHECKSUM_STATE;
+        CS_AppData.HkPacket.Payload.CfeCoreCSState = CS_CFECORE_CHECKSUM_STATE;
+
+        CFE_EVS_SendEvent(EventId, CFE_EVS_EventType_ERROR, ""Critical Data Store access error = 0x%08X"",
+                          (unsigned int)Result);
+        /*
+        ** CDS errors are not fatal - CS can still run...
+        */
+        Result = CFE_SUCCESS;
+    }
+
+    return Result;
+}"
+CS_BackgroundApp,"/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+bool CS_BackgroundApp(void)
+{
+    CS_Res_App_Table_Entry_t *AppResultsEntry;
+    bool                      DoneWithCycle   = false;
+    bool                      DoneWithEntry   = false;
+    uint32                    ComputedCSValue = 0;
+    CFE_Status_t              Status;
+
+    if (CS_AppData.HkPacket.Payload.AppCSState == CS_ChecksumState_ENABLED)
+    {
+        AppResultsEntry = CS_FindEnabledAppEntry();
+    }
+    else
+    {
+        AppResultsEntry = NULL;
+    }
+
+    if (AppResultsEntry != NULL)
+    {
+        /* we found an enabled entry to checksum */
+        /* If we complete an entry's checksum, this function will update it for us */
+        Status = CS_ComputeApp(AppResultsEntry, &ComputedCSValue, &DoneWithEntry);
+
+        /* We need to avoid the case of finishing a table, moving on to the next one
+            and computing an entry in that table, since it could put us above the
+            maximum bytes per cycle */
+        DoneWithCycle = true;
+
+        if (Status == CS_ERROR)
+        {
+            /* we had a miscompare */
+            CS_AppData.HkPacket.Payload.AppCSErrCounter++;
+
+            CFE_EVS_SendEvent(CS_APP_MISCOMPARE_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""Checksum Failure: Application %s, Expected: 0x%08X, Calculated: 0x%08X"",
+                              AppResultsEntry->Name, (unsigned int)(AppResultsEntry->ComparisonValue),
+                              (unsigned int)ComputedCSValue);
+        }
+
+        if (Status == CS_ERR_NOT_FOUND)
+        {
+            CFE_EVS_SendEvent(CS_COMPUTE_APP_NOT_FOUND_ERR_EID, CFE_EVS_EventType_ERROR,
+                              ""App table computing: App %s could not be found, skipping"", AppResultsEntry->Name);
+
+            DoneWithEntry = true;
+        }
+
+        if (DoneWithEntry)
+        {
+            CS_AppData.HkPacket.Payload.CurrentEntryInTable++;
+        }
+    }
+
+    if (AppResultsEntry == NULL || CS_AppData.HkPacket.Payload.CurrentEntryInTable >= CS_MAX_NUM_APP_TABLE_ENTRIES)
+    {
+        /* We are done with this table */
+        CS_GoToNextTable();
+    }
+
+    return DoneWithCycle;
+}"

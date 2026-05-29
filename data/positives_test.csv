@@ -1,0 +1,9 @@
+req_id,fn_id
+CS8000,CS_EnableAllCSCmd
+CS8001,CS_DisableAllCSCmd
+CS8002,CS_OneShotCmd
+CS8002,CS_OneShotChildTask
+CS8002.1,CS_OneShotChildTask
+CS8002.2,CS_OneShotCmd
+CS8002.3,CS_OneShotCmd
+CS8003,CS_CancelOneShotCmd
